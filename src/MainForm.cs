@@ -62,6 +62,8 @@ namespace LightSvnBrowser
         private Button openFile;
         private Button download;
         private Button favorite;
+        private Button submitFile;
+        private ToolStripMenuItem submitFileMenuItem;
         private CancellationTokenSource operation;
         private CancellationTokenSource previewOperation;
         private Repository currentRepository;
@@ -343,6 +345,14 @@ namespace LightSvnBrowser
             files.ItemActivate += async delegate { await ActivateSelectionAsync(); };
             files.ColumnClick += delegate(object sender, ColumnClickEventArgs args) { SortByColumn(args.Column); };
             files.SelectedIndexChanged += async delegate { if (!suppressSelectionPreview) await ShowSelectionAsync(); };
+            files.MouseDown += delegate(object sender, MouseEventArgs args)
+            {
+                if (args.Button != MouseButtons.Right) return;
+                ListViewItem target = files.GetItemAt(args.X, args.Y);
+                if (target == null) files.SelectedItems.Clear();
+                else { target.Selected = true; target.Focused = true; }
+                UpdateActions();
+            };
             files.KeyDown += async delegate(object sender, KeyEventArgs args)
             {
                 if (args.Alt && (args.KeyCode == Keys.Left || args.KeyCode == Keys.Right)) return;
@@ -352,17 +362,22 @@ namespace LightSvnBrowser
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("临时查看 / 打开文件夹", null, async delegate { await ActivateSelectionAsync(); });
             menu.Items.Add("下载到…", null, async delegate { await DownloadSelectionAsync(); });
+            submitFileMenuItem = new ToolStripMenuItem("提交新版本…");
+            submitFileMenuItem.Click += async delegate { await SubmitSelectionAsync(); };
+            menu.Items.Add(submitFileMenuItem);
+            menu.Opening += delegate { UpdateActions(); };
             menu.Items.Add("收藏 / 编辑标签备注", null, delegate { EditFavorite(); });
             menu.Items.Add("取消收藏", null, delegate { RemoveFavorite(); });
             menu.Items.Add("复制 SVN 地址", null, delegate { CopySelectedUrl(); });
             files.ContextMenuStrip = menu;
             content.Panel1.Controls.Add(files);
 
-            TableLayoutPanel detail = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(15, 8, 4, 10), BackColor = Color.FromArgb(248, 250, 252) };
+            TableLayoutPanel detail = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(15, 8, 4, 10), BackColor = Color.FromArgb(248, 250, 252) };
             detail.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
             detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
+            detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
             detail.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             detailTitle = new Label { Text = "文件预览", Font = new Font(Font.FontFamily, 11F, FontStyle.Bold), Dock = DockStyle.Fill, AutoEllipsis = true };
@@ -383,14 +398,20 @@ namespace LightSvnBrowser
             actions.Controls.Add(favorite);
             actions.Controls.Add(download);
             detail.Controls.Add(actions, 0, 2);
+            FlowLayoutPanel submissionActions = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
+            submitFile = MakeButton("提交新版本…", false);
+            submitFile.Width = 128;
+            submitFile.Click += async delegate { await SubmitSelectionAsync(); };
+            submissionActions.Controls.Add(submitFile);
+            detail.Controls.Add(submissionActions, 0, 3);
             detailNotes = new Label { Text = "收藏支持标签与备注。", Dock = DockStyle.Fill, ForeColor = Muted, AutoEllipsis = true, Padding = new Padding(0, 8, 0, 0) };
-            detail.Controls.Add(detailNotes, 0, 3);
+            detail.Controls.Add(detailNotes, 0, 4);
             Panel previewHost = new Panel { Dock = DockStyle.Fill, BackColor = Color.White, Margin = Padding.Empty };
             preview = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, BorderStyle = BorderStyle.None, BackColor = Color.White, Font = new Font("Consolas", 9F), Text = "目录浏览与文件名搜索不会下载整库。\r\n\r\n文本和图片可在此预览。\r\nOffice / PDF 临时交给本机默认程序查看。", AccessibleName = "文件预览内容" };
             image = new PictureBox { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.White, Visible = false };
             previewHost.Controls.Add(preview);
             previewHost.Controls.Add(image);
-            detail.Controls.Add(previewHost, 0, 4);
+            detail.Controls.Add(previewHost, 0, 5);
             content.Panel2.Controls.Add(detail);
             content.SizeChanged += delegate
             {
@@ -1070,6 +1091,67 @@ namespace LightSvnBrowser
             }
         }
 
+        /// <summary>Opens the single-file submission dialog for the selected repository file.</summary>
+        /// <remarks>Params: none.</remarks>
+        /// <returns>A task that completes after the dialog and preview refresh finish.</returns>
+        private async Task SubmitSelectionAsync()
+        {
+            FileItem item = SelectedFile();
+            if (item == null || item.Entry.IsDirectory || operation != null || demoMode) return;
+            CancelPreview();
+            try
+            {
+                using (SubmitFileDialog dialog = new SubmitFileDialog(store, service, item.Repository, item.Entry.Path, store.Config.UiFontSize))
+                {
+                    if (dialog.ShowDialog(this) != DialogResult.OK || dialog.Result == null) return;
+                    SubmissionResult result = dialog.Result;
+                    if (result.Entry != null)
+                    {
+                        RefreshSubmittedFile(item.Repository, item.Entry.Path, result.Entry);
+                        await ShowSelectionAsync();
+                    }
+                    else SetPreviewText("提交结果已确认。请刷新目录以读取文件的最新信息。");
+                    status.Text = result.Message;
+                    store.Log("submission.ui.complete", "repository=" + item.Repository.Id + "; path=" + item.Entry.Path + "; status=" + result.Status + "; revision=" + result.Revision);
+                }
+            }
+            catch (Exception error)
+            {
+                store.Log("submission.ui.error", "repository=" + item.Repository.Id + "; path=" + item.Entry.Path + "; error=" + error.Message);
+                ShowError(error);
+            }
+        }
+
+        /// <summary>Refreshes the submitted file in visible rows and saved navigation views.</summary>
+        /// <param name="repository">The repository owning the submitted file.</param>
+        /// <param name="path">The unchanged repository-relative target path.</param>
+        /// <param name="entry">The confirmed metadata of the submitted revision.</param>
+        /// <returns>None.</returns>
+        private void RefreshSubmittedFile(Repository repository, string path, SvnEntry entry)
+        {
+            IEnumerable<NavigationState> views = backHistory.Concat(forwardHistory);
+            if (currentView != null) views = views.Concat(new[] { currentView });
+            IEnumerable<FileItem> remembered = views.Where(view => view.Entries != null).SelectMany(view => view.Entries);
+            IEnumerable<FileItem> visible = files.Items.Cast<ListViewItem>().Select(row => row.Tag as FileItem).Where(file => file != null);
+            foreach (FileItem file in remembered.Concat(displayedEntries).Concat(visible))
+            {
+                if (String.Equals(file.Repository.Id, repository.Id, StringComparison.Ordinal) &&
+                    String.Equals(file.Entry.Path, path, StringComparison.Ordinal)) file.Entry = entry;
+            }
+            if (columnLayout == ColumnLayout.Files)
+            {
+                foreach (ListViewItem row in files.Items)
+                {
+                    FileItem file = row.Tag as FileItem;
+                    if (file == null || !String.Equals(file.Repository.Id, repository.Id, StringComparison.Ordinal) ||
+                        !String.Equals(file.Entry.Path, path, StringComparison.Ordinal)) continue;
+                    row.SubItems[SizeColumn].Text = FormatSize(entry.Size);
+                    row.SubItems[ModifiedColumn].Text = entry.ModifiedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+                }
+                ApplyColumnSort(true);
+            }
+        }
+
         private async Task ResolveFavoriteEntryAsync(FileItem item, CancellationToken token)
         {
             if (item.Favorite == null) return;
@@ -1271,6 +1353,9 @@ namespace LightSvnBrowser
             if (openFile != null) openFile.Enabled = item != null && !busy;
             if (favorite != null) favorite.Enabled = item != null && !busy;
             if (download != null) download.Enabled = item != null && !item.Entry.IsDirectory && !busy;
+            bool canSubmit = item != null && !item.Entry.IsDirectory && !busy && !demoMode;
+            if (submitFile != null) submitFile.Enabled = canSubmit;
+            if (submitFileMenuItem != null) submitFileMenuItem.Enabled = canSubmit;
             if (up != null) up.Enabled = currentRepository != null && !showingFavorites && !busy;
             if (back != null) back.Enabled = backHistory.Count > 0 && !busy;
             if (forward != null) forward.Enabled = forwardHistory.Count > 0 && !busy;

@@ -23,6 +23,7 @@ public static class TestRunner
 
     public static int Main(string[] args)
     {
+        if (args.Length > 0 && !String.IsNullOrEmpty(Environment.GetEnvironmentVariable("LIGHTSVN_TEST_REAL_SVN"))) return SubmissionProxySvn(args);
         if (args.Length > 0 && new[] { "list", "cat", "info" }.Contains(args[0])) return FakeSvn(args);
         if (args.Length > 0 && args[0] == "--benchmark") return RunBenchmarks(args);
         try
@@ -35,6 +36,7 @@ public static class TestRunner
             TestConfiguration();
             TestUrls();
             TestNativeRepository().GetAwaiter().GetResult();
+            TestSingleFileSubmission().GetAwaiter().GetResult();
             if (!String.IsNullOrEmpty(_bundledSvn)) TestLoopbackAuthentication().GetAwaiter().GetResult();
             TestProcessIsolation().GetAwaiter().GetResult();
             TestCertificateCompatibility().GetAwaiter().GetResult();
@@ -53,6 +55,237 @@ public static class TestRunner
         {
             Environment.SetEnvironmentVariable("LIGHTSVN_TEST_MODE", null);
             Environment.SetEnvironmentVariable("LIGHTSVN_TEST_PASSWORD", null);
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_REAL_SVN", null);
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE", null);
+        }
+    }
+
+    /// <summary>Exercises real single-file commits and durable recovery against a private local repository.</summary>
+    /// <remarks>Params: none.</remarks>
+    /// <returns>A task that completes when the repository checks pass.</returns>
+    private static async Task TestSingleFileSubmission()
+    {
+        const string relativePath = "目录 @ new/版本 100%@ 文件.bin";
+        const string initialContent = "original repository content\n";
+        const string modifiedContent = "locally edited replacement\n";
+        const string unrelatedPath = "unrelated.txt";
+        const string propertyName = "fixture:preserved";
+        const string propertyValue = "keep-this-property";
+        string root = Path.Combine(_testRoot, "single-file-submission");
+        string repositoryPath = Path.Combine(root, "repo @ 百分比%");
+        string seed = Path.Combine(root, "seed");
+        Directory.CreateDirectory(Path.Combine(seed, "目录 @ new"));
+        File.WriteAllText(Path.Combine(seed, relativePath.Replace('/', Path.DirectorySeparatorChar)), initialContent, new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(seed, unrelatedPath), "unrelated original", new UTF8Encoding(false));
+        RunLocal(Path.Combine(Path.GetDirectoryName(_svn), "svnadmin.exe"), "create", repositoryPath);
+        string repositoryUrl = new Uri(repositoryPath + Path.DirectorySeparatorChar).AbsoluteUri.TrimEnd('/');
+        RunLocal(_svn, "import", seed, repositoryUrl, "-m", "submission fixture import", "--non-interactive", "--no-auth-cache");
+        AppStore store = new AppStore(Path.Combine(root, "app-data"));
+        Repository repository = new Repository { Id = "submission-fixture", Name = "Local submission fixture", Url = repositoryUrl };
+        store.Config.Repositories.Add(repository);
+        store.Save();
+        SvnService service = new SvnService(store, _svn);
+        string targetUrl = SvnService.BuildUrl(repository, relativePath);
+        string mucc = Path.Combine(Path.GetDirectoryName(_svn), "svnmucc.exe");
+        RunLocal(mucc, "propset", propertyName, propertyValue, targetUrl, "-m", "preserve existing properties", "--non-interactive", "--no-auth-cache");
+        SvnEntry baseline = await service.GetLatestFileAsync(repository, relativePath, CancellationToken.None);
+        Assert(!baseline.IsDirectory && baseline.Path == relativePath && baseline.Size == Encoding.UTF8.GetByteCount(initialContent), "submission latest metadata resolves exact Unicode @ and percent target");
+        string localFile = Path.Combine(root, "different local name.bin");
+        await service.DownloadAsync(repository, baseline, localFile, CancellationToken.None);
+        DownloadSource source = service.GetDownloadSource(repository, relativePath, localFile);
+        Assert(source != null && source.Revision == baseline.Revision && source.LocalPath == localFile, "successful download records the original file revision");
+        AppStore reloaded = new AppStore(store.DataDirectory);
+        SvnService restarted = new SvnService(reloaded, _svn);
+        Assert(restarted.GetDownloadSource(repository, relativePath, localFile).Revision == baseline.Revision, "download source survives application restart");
+        Assert(service.GetDownloadSource(repository, unrelatedPath, localFile) == null, "download source is scoped to exact repository target");
+        string neverDownloaded = Path.Combine(root, "unknown-source.bin");
+        File.WriteAllText(neverDownloaded, modifiedContent, new UTF8Encoding(false));
+        Assert(service.GetDownloadSource(repository, relativePath, neverDownloaded) == null, "untracked local file has no invented download baseline");
+        SubmissionResult unchanged = await service.SubmitFileAsync(repository, baseline, localFile, "same content", null, CancellationToken.None);
+        Assert(unchanged.Status == SubmissionStatus.NoChanges, "identical bytes avoid creating an SVN revision");
+        Assert((await service.GetLatestFileAsync(repository, relativePath, CancellationToken.None)).Revision == baseline.Revision, "same-content submission preserves target revision");
+        File.WriteAllText(localFile, modifiedContent, new UTF8Encoding(false));
+        bool emptyMessageRejected = false;
+        try { await service.SubmitFileAsync(repository, baseline, localFile, "   ", null, CancellationToken.None); }
+        catch (ArgumentException) { emptyMessageRejected = true; }
+        Assert(emptyMessageRejected, "blank submission message is rejected before commit");
+        string unrelatedEdit = Path.Combine(root, "unrelated-edit.txt");
+        File.WriteAllText(unrelatedEdit, "changed by somebody else", new UTF8Encoding(false));
+        RunLocal(mucc, "put", unrelatedEdit, SvnService.BuildUrl(repository, unrelatedPath), "-m", "unrelated concurrent change", "--non-interactive", "--no-auth-cache");
+        SvnEntry unrelatedBefore = await service.GetLatestFileAsync(repository, unrelatedPath, CancellationToken.None);
+        bool changedAfterSnapshot = false;
+        IProgress<SubmissionProgress> editDuringCommit = new SubmissionProgressCallback(delegate(SubmissionProgress progress)
+        {
+            if (progress.IsCommitting && !changedAfterSnapshot)
+            {
+                File.WriteAllText(localFile, "later local save after submission snapshot\n", new UTF8Encoding(false));
+                changedAfterSnapshot = true;
+            }
+        });
+        SubmissionResult committed = await service.SubmitFileAsync(repository, baseline, localFile, "replace one document only", editDuringCommit, CancellationToken.None);
+        Assert(committed.Status == SubmissionStatus.Committed && !String.IsNullOrEmpty(committed.Revision), "unrelated repository revision does not block the selected file commit");
+        SvnEntry current = await service.GetLatestFileAsync(repository, relativePath, CancellationToken.None);
+        Assert(current.Revision == committed.Revision && current.Name == baseline.Name, "different local basename updates the fixed SVN name without rename");
+        Assert(File.ReadAllText(await service.FetchAsync(repository, current, CancellationToken.None)) == modifiedContent, "committed bytes exactly match selected local file");
+        Assert(changedAfterSnapshot && File.ReadAllText(localFile) == "later local save after submission snapshot\n", "later external saves cannot change the frozen commit snapshot or get overwritten by submission");
+        Assert((await service.GetLatestFileAsync(repository, unrelatedPath, CancellationToken.None)).Revision == unrelatedBefore.Revision, "single-file submission leaves unrelated file untouched");
+        string properties = RunSubmissionLocalOutput("propget", propertyName, targetUrl + "@HEAD");
+        Assert(properties.Trim() == propertyValue, "single-file replacement preserves existing SVN properties");
+        System.Xml.Linq.XDocument commitLog = System.Xml.Linq.XDocument.Parse(RunSubmissionLocalOutput("log", "--xml", "--verbose", "-r", committed.Revision, repositoryUrl + "@HEAD"));
+        string[] changedPaths = commitLog.Descendants("path").Select(item => item.Value).ToArray();
+        Assert(changedPaths.Length == 1 && changedPaths.Single() == "/" + relativePath, "SVN commit changes exactly the selected remote path");
+        bool staleRejected = false;
+        try { await service.SubmitFileAsync(repository, baseline, localFile, "must not overwrite a newer revision", null, CancellationToken.None); }
+        catch (InvalidOperationException) { staleRejected = true; }
+        catch (IOException) { staleRejected = true; }
+        Assert(staleRejected, "old selected-file baseline is rejected instead of overwriting newer content");
+        Assert((await service.GetLatestFileAsync(repository, relativePath, CancellationToken.None)).Revision == current.Revision, "stale rejection creates no commit");
+        using (CancellationTokenSource cancelled = new CancellationTokenSource())
+        {
+            cancelled.Cancel();
+            bool stopped = false;
+            try { await service.SubmitFileAsync(repository, current, localFile, "cancelled preparation", null, cancelled.Token); }
+            catch (OperationCanceledException) { stopped = true; }
+            Assert(stopped && service.GetPendingSubmission(repository, relativePath) == null, "cancelled preparation does not leave an unresolved commit");
+        }
+        string concurrentEdit = Path.Combine(root, "concurrent-edit.bin");
+        const string concurrentContent = "another editor wins the final commit race\n";
+        File.WriteAllText(concurrentEdit, concurrentContent, new UTF8Encoding(false));
+        bool raceCommitted = false;
+        SubmissionResult raced = await service.SubmitFileAsync(repository, current, localFile, "must reject a final concurrent edit", new SubmissionProgressCallback(delegate(SubmissionProgress progress)
+        {
+            if (progress.IsCommitting && !raceCommitted)
+            {
+                RunLocal(mucc, "put", concurrentEdit, targetUrl, "-m", "concurrent final edit", "--non-interactive", "--no-auth-cache");
+                raceCommitted = true;
+            }
+        }), CancellationToken.None);
+        Assert(raceCommitted && raced.Status == SubmissionStatus.NotCommitted, "server rejects a target change between final precheck and commit");
+        current = await service.GetLatestFileAsync(repository, relativePath, CancellationToken.None);
+        Assert(File.ReadAllText(await service.FetchAsync(repository, current, CancellationToken.None)) == concurrentContent, "final commit race never overwrites the other editor's new content");
+        Assert(service.GetPendingSubmission(repository, relativePath) == null, "explicit out-of-date rejection clears the pending barrier");
+        await service.DownloadAsync(repository, current, localFile, CancellationToken.None);
+        File.WriteAllText(localFile, "commit completed but response was lost\n", new UTF8Encoding(false));
+        Environment.SetEnvironmentVariable("LIGHTSVN_TEST_REAL_SVN", _svn);
+        Environment.SetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE", "drop-commit-response");
+        try
+        {
+            SvnService proxy = new SvnService(store, Assembly.GetExecutingAssembly().Location);
+            SubmissionResult lost = await proxy.SubmitFileAsync(repository, current, localFile, "recover this exact attempt", null, CancellationToken.None);
+            Assert(lost.Status == SubmissionStatus.Unknown, "lost commit response is reported as unverified rather than retryable failure");
+            SubmissionAttempt pending = proxy.GetPendingSubmission(repository, relativePath);
+            Assert(pending != null && !String.IsNullOrEmpty(pending.Id), "unverified commit leaves a durable attempt identifier");
+            SvnService afterRestart = new SvnService(new AppStore(store.DataDirectory), Assembly.GetExecutingAssembly().Location);
+            Assert(afterRestart.GetPendingSubmission(repository, relativePath).Id == pending.Id, "unverified attempt is restored after process restart");
+            SvnEntry afterLost = await afterRestart.GetLatestFileAsync(repository, relativePath, CancellationToken.None);
+            bool duplicateBlocked = false;
+            try { await afterRestart.SubmitFileAsync(repository, afterLost, localFile, "must not duplicate", null, CancellationToken.None); }
+            catch (InvalidOperationException) { duplicateBlocked = true; }
+            Assert(duplicateBlocked, "unverified target blocks a second commit across restarts");
+            SubmissionResult verified = await afterRestart.VerifySubmissionAsync(repository, pending, CancellationToken.None);
+            Assert(verified.Status == SubmissionStatus.Committed && verified.Revision == afterLost.Revision, "manual verification identifies the exact committed attempt");
+            Assert(afterRestart.GetPendingSubmission(repository, relativePath) == null, "confirmed commit clears the durable pending barrier");
+            Assert((await afterRestart.GetLatestFileAsync(repository, relativePath, CancellationToken.None)).Revision == afterLost.Revision, "verification never replays the commit");
+            await afterRestart.DownloadAsync(repository, afterLost, localFile, CancellationToken.None);
+            File.WriteAllText(localFile, "server committed despite post-commit hook failure\n", new UTF8Encoding(false));
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE", "post-commit-error");
+            SubmissionResult postCommit = await afterRestart.SubmitFileAsync(repository, afterLost, localFile, "post-commit hook error must remain unverified", null, CancellationToken.None);
+            Assert(postCommit.Status == SubmissionStatus.Unknown && afterRestart.GetPendingSubmission(repository, relativePath) != null,
+                "post-commit wrapper errors cannot be mistaken for a refused commit");
+            SubmissionResult postCommitVerified = await afterRestart.VerifySubmissionAsync(repository, postCommit.Attempt, CancellationToken.None);
+            Assert(postCommitVerified.Status == SubmissionStatus.Committed && afterRestart.GetPendingSubmission(repository, relativePath) == null,
+                "manual verification recovers a committed revision despite post-commit hook errors");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_REAL_SVN", null);
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE", null);
+        }
+        Assert(File.ReadAllText(localFile) == "server committed despite post-commit hook failure\n", "submission and recovery preserve the user's editable local file");
+    }
+
+    /// <summary>Delivers submission progress synchronously so tests can model an external save at commit time.</summary>
+    /// <remarks>Author: Codex; date: 2026-11-02.</remarks>
+    private sealed class SubmissionProgressCallback : IProgress<SubmissionProgress>
+    {
+        private readonly Action<SubmissionProgress> callback;
+
+        /// <summary>Stores the deterministic progress callback.</summary>
+        /// <param name="callback">The action to run for each progress message.</param>
+        /// <returns>None.</returns>
+        internal SubmissionProgressCallback(Action<SubmissionProgress> callback) { this.callback = callback; }
+
+        /// <summary>Runs the callback on the reporting thread.</summary>
+        /// <param name="value">The current preparation or commit phase.</param>
+        /// <returns>None.</returns>
+        public void Report(SubmissionProgress value) { callback(value); }
+    }
+
+    /// <summary>Returns text from a private local fixture SVN command without accessing user configuration.</summary>
+    /// <param name="arguments">The SVN arguments for this fixture.</param>
+    /// <returns>The command standard output.</returns>
+    private static string RunSubmissionLocalOutput(params string[] arguments)
+    {
+        string configDirectory = Path.Combine(_testRoot, "fixture-svn-config");
+        List<string> options = arguments.Concat(new[] { "--non-interactive", "--no-auth-cache", "--config-dir", configDirectory }).ToList();
+        ProcessStartInfo start = new ProcessStartInfo(_svn, String.Join(" ", options.Select(Quote)))
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, WorkingDirectory = _testRoot
+        };
+        using (Process process = Process.Start(start))
+        {
+            Task<string> output = process.StandardOutput.ReadToEndAsync();
+            Task<string> errors = process.StandardError.ReadToEndAsync();
+            const int commandTimeout = 30000;
+            if (!process.WaitForExit(commandTimeout)) { process.Kill(); throw new TimeoutException("Submission fixture command timed out."); }
+            Task.WaitAll(output, errors);
+            const int successfulExit = 0;
+            if (process.ExitCode != successfulExit) throw new Exception("Submission fixture command failed: " + errors.Result);
+            return output.Result;
+        }
+    }
+
+    /// <summary>Passes fixture SVN commands to the real client and can deliberately lose a commit response.</summary>
+    /// <param name="arguments">The application's isolated client invocation.</param>
+    /// <returns>The real exit code, or a simulated transport failure after commit.</returns>
+    private static int SubmissionProxySvn(string[] arguments)
+    {
+        const string commitOperation = "commit";
+        const string lostResponseMode = "drop-commit-response";
+        const string postCommitErrorMode = "post-commit-error";
+        const int transportFailure = 1;
+        const int successfulExit = 0;
+        string executable = Environment.GetEnvironmentVariable("LIGHTSVN_TEST_REAL_SVN");
+        ProcessStartInfo start = new ProcessStartInfo(executable, String.Join(" ", arguments.Select(Quote)))
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true,
+            RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        using (Process process = Process.Start(start))
+        using (MemoryStream output = new MemoryStream())
+        {
+            Task copy = process.StandardOutput.BaseStream.CopyToAsync(output);
+            Task<string> errors = process.StandardError.ReadToEndAsync();
+            process.StandardInput.Write(Console.In.ReadToEnd());
+            process.StandardInput.Close();
+            process.WaitForExit();
+            Task.WaitAll(copy, errors);
+            if (arguments[0] == commitOperation && process.ExitCode == successfulExit && Environment.GetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE") == lostResponseMode)
+            {
+                Console.Error.WriteLine("svn: E170013: fixture connection dropped after server commit.");
+                return transportFailure;
+            }
+            if (arguments[0] == commitOperation && process.ExitCode == successfulExit && Environment.GetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE") == postCommitErrorMode)
+            {
+                Console.Error.WriteLine("svn: E165007: Commit succeeded, but post-commit processing failed.");
+                Console.Error.WriteLine("svn: E165001: fixture post-commit hook reported an error.");
+                return transportFailure;
+            }
+            output.Position = 0;
+            output.CopyTo(Console.OpenStandardOutput());
+            Console.Error.Write(errors.Result);
+            return process.ExitCode;
         }
     }
 
@@ -275,6 +508,15 @@ public static class TestRunner
                 Assert(listing.Count == 1 && listing[0].Name == "auth-proof.bin", "bundled CLI authenticates via stdin with real svnserve CRAM");
                 string fetched = await client.FetchAsync(repository, listing[0], CancellationToken.None);
                 Assert(HashBytes(File.ReadAllBytes(fetched)) == HashBytes(binary), "authenticated bundled binary SHA256 exact");
+                string readOnlyReplacement = Path.Combine(root, "cannot-write.bin");
+                File.WriteAllText(readOnlyReplacement, "this account can read but must not write", new UTF8Encoding(false));
+                SvnEntry readOnlyBaseline = await client.GetLatestFileAsync(repository, listing[0].Path, CancellationToken.None);
+                SubmissionResult denied = await client.SubmitFileAsync(repository, readOnlyBaseline, readOnlyReplacement, "write must be refused", null, CancellationToken.None);
+                Assert(denied.Status == SubmissionStatus.NotCommitted, "read-only repository rejection is explicitly reported as not committed");
+                Assert(client.GetPendingSubmission(repository, listing[0].Path) == null, "explicit permission rejection does not leave a permanent pending barrier");
+                Assert((await client.GetLatestFileAsync(repository, listing[0].Path, CancellationToken.None)).Revision == readOnlyBaseline.Revision, "write refusal preserves the server file revision");
+                string[] commitStarts = Directory.GetFiles(store.LogDirectory).SelectMany(File.ReadAllLines).Where(line => line.Contains("svn_start operation=commit ")).ToArray();
+                Assert(commitStarts.Length == 1, "write refusal starts the commit only once without automatic retries");
                 Assert(!Directory.EnumerateFiles(store.SvnConfigDirectory, "*", SearchOption.AllDirectories).Any(p => p.IndexOf("svn.simple", StringComparison.OrdinalIgnoreCase) >= 0), "authenticated request writes no credential cache");
                 string logs = String.Join("", Directory.GetFiles(store.LogDirectory).Select(File.ReadAllText));
                 Assert(!logs.Contains(password), "real authenticated requests do not log password");

@@ -377,7 +377,7 @@ namespace LightSvnBrowser
         }
     }
 
-    public sealed class SvnService
+    public sealed partial class SvnService
     {
         private const string HttpsScheme = "https";
         private const string CertificateFailuresOption = "--trust-server-cert-failures";
@@ -576,6 +576,7 @@ namespace LightSvnBrowser
                 if (File.Exists(target)) File.Replace(destinationStage, target, null);
                 else File.Move(destinationStage, target);
                 File.SetAttributes(target, File.GetAttributes(target) & ~FileAttributes.ReadOnly);
+                RecordDownloadSource(repository, entry, target);
                 _store.Log("download_complete", "repository=" + repository.Id + " path=" + entry.Path + " target=" + target);
             }
             finally { AppStore.TryDeleteFile(staged); AppStore.TryDeleteFile(destinationStage); }
@@ -706,7 +707,7 @@ namespace LightSvnBrowser
                             if (password.Length > 0) error = error.Replace(password, "[已隐藏]");
                             if (!repository.AllowIpCertificateNameMismatch && error.IndexOf(CertificateNameErrorText, StringComparison.OrdinalIgnoreCase) >= 0)
                                 error += "\r\n若此仓库必须通过 IP 访问，可在“编辑仓库”中勾选“允许 IP 地址与证书域名不一致（仅此仓库）”。";
-                            throw new IOException("SVN 请求失败（" + process.ExitCode.ToString(CultureInfo.InvariantCulture) + "），未自动重试。\r\n" + error.Trim());
+                            throw new SvnCommandException("SVN 请求失败（" + process.ExitCode.ToString(CultureInfo.InvariantCulture) + "），未自动重试。\r\n" + error.Trim(), error);
                         }
                     }
                     _store.Log("svn_complete", "operation=" + operation + " repository=" + repository.Id);

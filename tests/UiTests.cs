@@ -80,6 +80,9 @@ namespace LightSvnBrowser
             Run("repository headers sort every column and preserve selection without SVN", RepositoryColumnSorting);
             Run("directory and search sorting uses real sizes and timestamps with global row order", EntryColumnSorting);
             Run("favorite columns sort tags notes paths and retain independent schema preferences", FavoriteColumnSorting);
+            Run("submission entry is scoped to one file and refresh preserves sort selection and history", SubmissionEntryAndRefresh);
+            Run("submission confirmation keeps a fixed target and retains inputs after preparation failure", SubmissionDialogValidation);
+            Run("submission dialog renders at font range endpoints without clipped controls", SubmissionDialogFontSizes);
             Run("history restores sorted arrows selection and originally unsorted snapshots", SortingHistory);
             Run("cancelled navigation cannot overwrite newer directory", NavigationRace);
             Run("switching to favorites cancels pending navigation", NavigationToFavorites);
@@ -944,7 +947,14 @@ namespace LightSvnBrowser
             File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "fake-svn-call-" + Guid.NewGuid().ToString("N") + ".txt"), args[0]);
             Console.OutputEncoding = new UTF8Encoding(false);
             if (args[0] == "cat") { Console.Write(Payload); return 0; }
-            if (args[0] == "info") { Console.Write("<?xml version=\"1.0\"?><info><entry kind=\"dir\" revision=\"7\" path=\"docs\" /></info>"); return 0; }
+            const string infoOperation = "info";
+            const string submissionName = "manual.txt";
+            if (args[0] == infoOperation && args[args.Length - 1].IndexOf(submissionName, StringComparison.Ordinal) >= 0)
+            {
+                Console.Write("<?xml version=\"1.0\"?><info><entry kind=\"file\" revision=\"7\" path=\"manual.txt\"><commit revision=\"7\"><author>offline</author><date>2026-11-02T02:30:00Z</date></commit></entry></info>");
+                return 0;
+            }
+            if (args[0] == infoOperation) { Console.Write("<?xml version=\"1.0\"?><info><entry kind=\"dir\" revision=\"7\" path=\"docs\" /></info>"); return 0; }
             string url = args[args.Length - 1];
             if (url.IndexOf("/sort-fixture", StringComparison.Ordinal) >= 0)
             {
@@ -961,6 +971,141 @@ namespace LightSvnBrowser
             string name = slow ? "slow-result.txt" : url.IndexOf("/fast", StringComparison.Ordinal) >= 0 ? "fast-result.txt" : "manual.txt";
             Console.Write("<?xml version=\"1.0\"?><lists><list path=\"offline\"><entry kind=\"file\"><name>" + name + "</name><size>" + Encoding.UTF8.GetByteCount(Payload) + "</size><commit revision=\"7\"><author>offline</author><date>2026-11-02T02:30:00Z</date></commit></entry></list></lists>");
             return 0;
+        }
+
+        /// <summary>Checks file-only entry availability and post-commit metadata in sorted cached views.</summary>
+        /// <returns>None.</returns>
+        private static void SubmissionEntryAndRefresh()
+        {
+            AppStore store = NewStore("submission-entry");
+            Repository repository = AddRepository(store, "submission-ui", "Submission fixture", "Examples");
+            using (MainForm form = OpenMain(store))
+            {
+                Assert(!Field<Button>(form, "submitFile").Enabled && !Field<ToolStripMenuItem>(form, "submitFileMenuItem").Enabled,
+                    "Submission was enabled without a selected file.");
+                Pump((Task)Call(form, "NavigateAsync", repository, "sort-fixture"));
+                ListView list = Field<ListView>(form, "files");
+                SelectSortRow(form, list.Items.Cast<ListViewItem>().Single(row => row.Text == SortFolderName));
+                Call(form, "UpdateActions");
+                Assert(!Field<Button>(form, "submitFile").Enabled, "Submission was enabled for a directory.");
+                ListViewItem selected = list.Items.Cast<ListViewItem>().Single(row => row.Text == SortSmallName);
+                SelectSortRow(form, selected);
+                Call(form, "UpdateActions");
+                Assert(Field<Button>(form, "submitFile").Enabled && Field<ToolStripMenuItem>(form, "submitFileMenuItem").Enabled,
+                    "A selected file did not enable both submission entry points.");
+                using (CancellationTokenSource busy = new CancellationTokenSource())
+                {
+                    SetField(form, "operation", busy);
+                    Call(form, "UpdateActions");
+                    Assert(!Field<Button>(form, "submitFile").Enabled && !Field<ToolStripMenuItem>(form, "submitFileMenuItem").Enabled,
+                        "Submission entry stayed available during another operation.");
+                    SetField(form, "operation", null);
+                }
+                SetField(form, "demoMode", true);
+                Call(form, "UpdateActions");
+                Assert(!Field<Button>(form, "submitFile").Enabled, "Demo fixtures exposed a writable SVN action.");
+                SetField(form, "demoMode", false);
+                const int sizeColumn = 2;
+                Call(form, "SortByColumn", sizeColumn);
+                int calls = FakeCalls(store);
+                const long updatedSize = 11L * 1024L * 1024L * 1024L;
+                SvnEntry updated = new SvnEntry { Name = SortSmallName, Path = "sort-fixture/" + SortSmallName,
+                    Revision = "8", Size = updatedSize, Author = "fixture", ModifiedUtc = DateTime.UtcNow };
+                Call(form, "RefreshSubmittedFile", repository, updated.Path, updated);
+                Assert(Object.ReferenceEquals(list.SelectedItems[0], selected) && list.Items[list.Items.Count - 1].Text == SortSmallName,
+                    "Post-submit refresh lost selection or failed to restore the active size ordering.");
+                object selectedTag = selected.Tag;
+                Assert(((SvnEntry)selectedTag.GetType().GetField("Entry").GetValue(selectedTag)).Revision == updated.Revision,
+                    "Post-submit row retained the old file revision.");
+                Call(form, "ShowRepositories", "temporary submission history view");
+                Call(form, "GoBack");
+                Assert(list.Items[list.Items.Count - 1].Text == SortSmallName && list.SelectedItems[0].Text == SortSmallName,
+                    "History restored stale post-submit metadata or lost the selected row.");
+                Assert(FakeCalls(store) == calls, "Refreshing submitted metadata or history contacted SVN unnecessarily.");
+            }
+        }
+
+        /// <summary>Pumps pending form work without starting a duplicate server read.</summary>
+        /// <param name="dialog">The confirmation window under test.</param>
+        /// <returns>None.</returns>
+        private static void WaitSubmissionIdle(SubmitFileDialog dialog)
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(12);
+            while (Field<bool>(dialog, "_busy") && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(10); }
+            Assert(!Field<bool>(dialog, "_busy"), "Submission dialog initialization timed out.");
+            Application.DoEvents();
+        }
+
+        /// <summary>Checks explicit content confirmation and input retention after a real local file access failure.</summary>
+        /// <returns>None.</returns>
+        private static void SubmissionDialogValidation()
+        {
+            AppStore store = NewStore("submission-dialog");
+            Repository repository = AddRepository(store, "submission-confirm", "Confirmation fixture", "Examples");
+            SvnService service = new SvnService(store, Application.ExecutablePath);
+            const string relativePath = "设计/manual.txt";
+            using (SubmitFileDialog dialog = new SubmitFileDialog(store, service, repository, relativePath, DefaultUiFontSize))
+            {
+                Assert(FakeCalls(store) == 0 && !Field<Button>(dialog, "_submit").Enabled, "Constructing the dialog contacted SVN or enabled premature submission.");
+                OpenOffscreen(dialog);
+                WaitSubmissionIdle(dialog);
+                Assert(Field<SvnEntry>(dialog, "_latest") != null, "Confirmation did not obtain fresh server metadata.");
+                TextBox target = Field<TextBox>(dialog, "_targetPath");
+                Assert(target.ReadOnly && target.Text == relativePath + Environment.NewLine + SvnService.BuildUrl(repository, relativePath), "Target path is editable or does not show both the readable name and exact SVN URL.");
+                string localFile = Path.Combine(store.DataDirectory, "different-local-name.txt");
+                File.WriteAllText(localFile, "edited local content", new UTF8Encoding(false));
+                Call(dialog, "SetLocalFile", localFile);
+                Field<TextBox>(dialog, "_message").Text = "describe the document update";
+                CheckBox acknowledgement = Field<CheckBox>(dialog, "_acknowledge");
+                Assert(acknowledgement.Enabled && !Field<Button>(dialog, "_submit").Enabled, "Unknown local provenance did not require explicit confirmation.");
+                Assert(Field<Label>(dialog, "_nameNotice").Text.Contains("manual.txt") && Field<Label>(dialog, "_nameNotice").Text.Contains(Path.GetFileName(localFile)),
+                    "Different local basename did not explain the fixed remote target.");
+                acknowledgement.Checked = true;
+                Assert(Field<Button>(dialog, "_submit").Enabled, "A valid reviewed file and message did not enable submission.");
+                Field<TextBox>(dialog, "_message").Text = "   ";
+                Assert(!Field<Button>(dialog, "_submit").Enabled, "Whitespace-only commit message was accepted.");
+                const string message = "keep this message after failure";
+                Field<TextBox>(dialog, "_message").Text = message;
+                using (FileStream locked = new FileStream(localFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    Pump((Task)Call(dialog, "SubmitAsync"));
+                Assert(Field<TextBox>(dialog, "_localFile").Text == localFile && Field<TextBox>(dialog, "_message").Text == message,
+                    "Preparation failure discarded local file selection or commit message.");
+                Assert(dialog.DialogResult != DialogResult.OK && !Field<Button>(dialog, "_submit").Enabled,
+                    "Preparation failure reported success or allowed submission without refreshing the baseline.");
+                Assert(service.GetPendingSubmission(repository, relativePath) == null, "Locked local source left a falsely unresolved server commit.");
+                int callsAfterFailure = FakeCalls(store);
+                Application.DoEvents();
+                Assert(FakeCalls(store) == callsAfterFailure, "Preparation failure scheduled an automatic retry.");
+                SubmissionAttempt pending = new SubmissionAttempt { Id = "offline-pending-attempt", Path = relativePath, BaseRevision = "7", LocalFile = localFile, Message = message };
+                Call(dialog, "HandleResult", new SubmissionResult { Status = SubmissionStatus.Unknown, Attempt = pending, Message = "offline response lost" });
+                Call(dialog, "UpdateAvailability");
+                Assert(!Field<Button>(dialog, "_submit").Enabled && Field<Button>(dialog, "_verify").Enabled,
+                    "Unverified commit did not block repeated submission and expose manual verification.");
+                Assert(Field<TextBox>(dialog, "_localFile").Text == localFile && Field<TextBox>(dialog, "_message").Text == message
+                    && Field<TextBox>(dialog, "_message").ReadOnly && !Field<Button>(dialog, "_chooseLocal").Enabled,
+                    "Unverified commit lost its inputs or allowed them to be replaced before verification.");
+                Assert(FakeCalls(store) == callsAfterFailure, "Unverified commit automatically retried or verified without a user action.");
+            }
+        }
+
+        /// <summary>Renders confirmation at the supported font extremes and checks visible control bounds.</summary>
+        /// <returns>None.</returns>
+        private static void SubmissionDialogFontSizes()
+        {
+            List<string> layoutIssues = new List<string>();
+            foreach (float size in new[] { UiFontSettings.MinimumSize, MaximumUiFontSize })
+            {
+                AppStore store = NewStore("submission-font");
+                Repository repository = AddRepository(store, "submission-font", "Single-file submission fixture", "Examples");
+                using (SubmitFileDialog dialog = new SubmitFileDialog(store, new SvnService(store, Application.ExecutablePath), repository, "设计/manual.txt", size))
+                {
+                    OpenOffscreen(dialog);
+                    WaitSubmissionIdle(dialog);
+                    string screenshot = Path.Combine(runDirectory, "submission-font-" + size.ToString("0.#", CultureInfo.InvariantCulture) + ".png");
+                    SaveFontScreenshot(dialog, size, screenshot, layoutIssues);
+                }
+            }
+            Assert(layoutIssues.Count == 0, String.Join(Environment.NewLine, layoutIssues));
         }
 
         private static void DataDirectoryShortcut()
