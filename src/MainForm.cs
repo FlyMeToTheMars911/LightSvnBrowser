@@ -18,6 +18,9 @@ namespace LightSvnBrowser
         private const int TextPreviewLimit = 2 * 1024 * 1024;
         private const int ImagePreviewLimit = 20 * 1024 * 1024;
         private const int MaximumHistoryViews = 30;
+        private const int UnsortedColumn = -1;
+        private const int SizeColumn = 2;
+        private const int ModifiedColumn = 3;
         private const string FavoritesKey = "favorites";
         private const string RepositoriesKey = "repositories";
         private static readonly Color Accent = Color.FromArgb(37, 99, 235);
@@ -71,11 +74,55 @@ namespace LightSvnBrowser
         private bool restoringHistory;
         private NavigationState currentView;
         private List<FileItem> displayedEntries = new List<FileItem>();
+        private ColumnLayout columnLayout;
+        private int sortColumn = UnsortedColumn;
+        private bool sortDescending;
+        private readonly Dictionary<ColumnLayout, ColumnSortState> columnSorts = new Dictionary<ColumnLayout, ColumnSortState>();
         private readonly List<NavigationState> backHistory = new List<NavigationState>();
         private readonly List<NavigationState> forwardHistory = new List<NavigationState>();
         private readonly List<Button> operationButtons = new List<Button>();
 
         private enum ViewKind { Repositories, Directory, Search, Favorites }
+        private enum ColumnLayout { Repositories, Files, Favorites }
+
+        /// <summary>Stores one list layout's session sorting preference.</summary>
+        /// <remarks>Author: Codex; date: 2026-11-02.</remarks>
+        private sealed class ColumnSortState
+        {
+            public int Column = UnsortedColumn;
+            public bool Descending;
+        }
+
+        /// <summary>Compares visible rows using source metadata for size and modification time.</summary>
+        /// <remarks>Author: Codex; date: 2026-11-02.</remarks>
+        private sealed class FileRowComparer : System.Collections.IComparer
+        {
+            private readonly ColumnLayout layout;
+            private readonly int column;
+            private readonly bool descending;
+
+            public FileRowComparer(ColumnLayout layout, int column, bool descending)
+            {
+                this.layout = layout;
+                this.column = column;
+                this.descending = descending;
+            }
+
+            public int Compare(object left, object right)
+            {
+                ListViewItem first = (ListViewItem)left;
+                ListViewItem second = (ListViewItem)right;
+                int result;
+                if (layout == ColumnLayout.Files && column == SizeColumn)
+                    result = ((FileItem)first.Tag).Entry.Size.CompareTo(((FileItem)second.Tag).Entry.Size);
+                else if (layout == ColumnLayout.Files && column == ModifiedColumn)
+                    result = ((FileItem)first.Tag).Entry.ModifiedUtc.CompareTo(((FileItem)second.Tag).Entry.ModifiedUtc);
+                else result = StringComparer.CurrentCultureIgnoreCase.Compare(first.SubItems[column].Text, second.SubItems[column].Text);
+                if (result == 0) result = StringComparer.CurrentCultureIgnoreCase.Compare(first.Text, second.Text);
+                if (result == 0) result = StringComparer.Ordinal.Compare(ItemKey(first.Tag), ItemKey(second.Tag));
+                return descending ? -Math.Sign(result) : Math.Sign(result);
+            }
+        }
 
         private sealed class NavigationState
         {
@@ -93,6 +140,8 @@ namespace LightSvnBrowser
             public string SelectedKey;
             public int TopIndex;
             public int[] ColumnWidths;
+            public int SortColumn = UnsortedColumn;
+            public bool SortDescending;
         }
 
         private sealed class NavigationItem
@@ -292,6 +341,7 @@ namespace LightSvnBrowser
             icons.Images.Add(DrawIcon(false));
             files.SmallImageList = icons;
             files.ItemActivate += async delegate { await ActivateSelectionAsync(); };
+            files.ColumnClick += delegate(object sender, ColumnClickEventArgs args) { SortByColumn(args.Column); };
             files.SelectedIndexChanged += async delegate { if (!suppressSelectionPreview) await ShowSelectionAsync(); };
             files.KeyDown += async delegate(object sender, KeyEventArgs args)
             {
@@ -509,7 +559,7 @@ namespace LightSvnBrowser
             currentPath = String.Empty;
             pageTitle.Text = String.IsNullOrEmpty(group) ? "我的仓库" : group;
             address.Text = "数据目录：" + store.DataDirectory;
-            SetColumns(new[] { "仓库名称", "分组", "SVN 地址", "登录用户" }, new[] { 170, 130, 340, 130 });
+            SetColumns(ColumnLayout.Repositories, new[] { "仓库名称", "分组", "SVN 地址", "登录用户" }, new[] { 170, 130, 340, 130 });
             foreach (Repository repository in store.Config.Repositories.Where(r => String.IsNullOrEmpty(group) || String.Equals(r.Group, group, StringComparison.OrdinalIgnoreCase) || (r.Group ?? String.Empty).StartsWith(group + "/", StringComparison.OrdinalIgnoreCase)))
             {
                 ListViewItem row = new ListViewItem(repository.Name, 0) { Tag = repository };
@@ -518,20 +568,70 @@ namespace LightSvnBrowser
                 row.SubItems.Add(repository.Username ?? String.Empty);
                 files.Items.Add(row);
             }
+            if (!restoringHistory) ApplyColumnSort(false);
             indexStatus.Text = store.Config.Repositories.Count == 0 ? "点击左侧“添加 SVN 仓库”。分组填写“团队/产品”即可形成文件夹。" : "双击仓库进入目录；在左侧按文件夹组织多个地址。";
             ClearDetails();
             CommitView(ViewKind.Repositories, group);
             UpdateActions();
         }
 
-        private void SetColumns(string[] names, int[] widths)
+        private void SetColumns(ColumnLayout layout, string[] names, int[] widths)
         {
             bool previousSuppression = suppressSelectionPreview;
             suppressSelectionPreview = true;
+            files.ListViewItemSorter = null;
             files.Items.Clear();
             files.Columns.Clear();
-            for (int index = 0; index < names.Length; index++) files.Columns.Add(names[index], (int)Math.Round(widths[index] * Font.SizeInPoints / UiFontSettings.DefaultSize));
+            columnLayout = layout;
+            ColumnSortState saved;
+            columnSorts.TryGetValue(layout, out saved);
+            sortColumn = saved == null ? UnsortedColumn : saved.Column;
+            sortDescending = saved != null && saved.Descending;
+            for (int index = 0; index < names.Length; index++)
+                files.Columns.Add(new ColumnHeader { Text = names[index], Tag = names[index], Width = (int)Math.Round(widths[index] * Font.SizeInPoints / UiFontSettings.DefaultSize) });
             suppressSelectionPreview = previousSuppression;
+        }
+
+        private void SortByColumn(int column)
+        {
+            if (operation != null || column < 0 || column >= files.Columns.Count) return;
+            sortDescending = column == sortColumn && !sortDescending;
+            sortColumn = column;
+            Stopwatch timer = Stopwatch.StartNew();
+            ApplyColumnSort(true);
+            CaptureViewPosition();
+            store.Log("ui.sort", "layout=" + columnLayout + "; column=" + column + "; descending=" + sortDescending + "; rows=" + files.Items.Count + "; ms=" + timer.ElapsedMilliseconds);
+        }
+
+        private void ApplyColumnSort(bool updateView)
+        {
+            bool previousSuppression = suppressSelectionPreview;
+            suppressSelectionPreview = true;
+            files.BeginUpdate();
+            try
+            {
+                ListViewItem selected = files.SelectedItems.Count == 0 ? null : files.SelectedItems[0];
+                if (sortColumn != UnsortedColumn)
+                {
+                    files.ListViewItemSorter = new FileRowComparer(columnLayout, sortColumn, sortDescending);
+                    files.Sort();
+                    files.ListViewItemSorter = null;
+                }
+                for (int index = 0; index < files.Columns.Count; index++)
+                    files.Columns[index].Text = (string)files.Columns[index].Tag + (index == sortColumn ? (sortDescending ? " ▼" : " ▲") : String.Empty);
+                if (selected != null) { selected.Selected = true; selected.Focused = true; selected.EnsureVisible(); }
+                else if (files.Items.Count > 0) files.TopItem = files.Items[0];
+                if (columnLayout == ColumnLayout.Files)
+                    displayedEntries = files.Items.Cast<ListViewItem>().Select(row => (FileItem)row.Tag).ToList();
+                columnSorts[columnLayout] = new ColumnSortState { Column = sortColumn, Descending = sortDescending };
+                if (updateView && currentView != null)
+                {
+                    currentView.SortColumn = sortColumn;
+                    currentView.SortDescending = sortDescending;
+                    if (columnLayout == ColumnLayout.Files) currentView.Entries = displayedEntries;
+                }
+            }
+            finally { files.EndUpdate(); suppressSelectionPreview = previousSuppression; }
         }
 
         private void CaptureViewPosition()
@@ -541,6 +641,8 @@ namespace LightSvnBrowser
             try { currentView.TopIndex = files.TopItem == null ? 0 : files.TopItem.Index; }
             catch (InvalidOperationException) { currentView.TopIndex = 0; }
             currentView.ColumnWidths = files.Columns.Cast<ColumnHeader>().Select(column => column.Width).ToArray();
+            currentView.SortColumn = sortColumn;
+            currentView.SortDescending = sortDescending;
         }
 
         private static string ItemKey(object item)
@@ -558,7 +660,8 @@ namespace LightSvnBrowser
                 Kind = kind, RepositoryId = currentRepository == null ? null : currentRepository.Id,
                 Path = currentPath, Group = group ?? String.Empty, Query = executedQuery ?? search.Text, Scope = executedScope ?? scope.SelectedIndex,
                 Title = pageTitle.Text, Address = address.Text, IndexStatus = indexStatus.Text, Status = status.Text,
-                Entries = kind == ViewKind.Directory || kind == ViewKind.Search ? displayedEntries : null
+                Entries = kind == ViewKind.Directory || kind == ViewKind.Search ? displayedEntries : null,
+                SortColumn = sortColumn, SortDescending = sortDescending
             };
             if (!restoringHistory && currentView != null)
             {
@@ -609,6 +712,9 @@ namespace LightSvnBrowser
                     PopulateEntries(target.Entries ?? new List<FileItem>(), true);
                     ClearDetails();
                 }
+                sortColumn = target.SortColumn;
+                sortDescending = target.SortDescending;
+                ApplyColumnSort(false);
                 currentView = target;
                 search.Text = target.Query ?? String.Empty;
                 pageTitle.Text = target.Title;
@@ -723,8 +829,9 @@ namespace LightSvnBrowser
             files.BeginUpdate();
             try
             {
-                SetColumns(new[] { "名称", "类型", "大小", "修改时间", "所在路径" }, new[] { 210, 72, 85, 145, 350 });
+                SetColumns(ColumnLayout.Files, new[] { "名称", "类型", "大小", "修改时间", "所在路径" }, new[] { 210, 72, 85, 145, 350 });
                 files.Items.AddRange(rows);
+                if (!restoringHistory) ApplyColumnSort(false);
             }
             finally { files.EndUpdate(); suppressSelectionPreview = previousSuppression; }
             UpdateActions();
@@ -813,7 +920,7 @@ namespace LightSvnBrowser
             currentPath = String.Empty;
             pageTitle.Text = "我的收藏";
             address.Text = "个人收藏 · 支持按名称、标签、备注搜索";
-            SetColumns(new[] { "名称", "类型", "标签", "备注", "所在路径" }, new[] { 190, 70, 140, 200, 350 });
+            SetColumns(ColumnLayout.Favorites, new[] { "名称", "类型", "标签", "备注", "所在路径" }, new[] { 190, 70, 140, 200, 350 });
             foreach (Favorite saved in store.Config.Favorites)
             {
                 Repository repository = store.Config.Repositories.FirstOrDefault(r => r.Id == saved.RepositoryId);
@@ -828,6 +935,7 @@ namespace LightSvnBrowser
                 row.SubItems.Add(repository.Name + "/" + saved.Path);
                 files.Items.Add(row);
             }
+            if (!restoringHistory) ApplyColumnSort(false);
             indexStatus.Text = "收藏保存文件入口，打开时读取最新版本。Ctrl+D 可编辑标签和备注。";
             status.Text = files.Items.Count + " 个收藏 · 在顶部搜索框查找名称、标签或备注。";
             ClearDetails();

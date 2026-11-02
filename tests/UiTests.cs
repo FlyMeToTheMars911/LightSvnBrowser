@@ -22,6 +22,12 @@ namespace LightSvnBrowser
         private const float MaximumUiFontSize = 16F;
         private const float FractionalUiFontSize = 12.5F;
         private const float FontPointTolerance = 0.15F;
+        private const string SortLargeName = "sort-A-large.pdf";
+        private const string SortMediumName = "sort-B-medium.md";
+        private const string SortSmallName = "sort-C-small.txt";
+        private const string SortTinyName = "sort-D-tiny.txt";
+        private const string SortThreeGbName = "sort-E-three-gb.txt";
+        private const string SortFolderName = "sort-Z-folder";
         private static int passed;
         private static int failed;
         private static string runDirectory;
@@ -71,6 +77,10 @@ namespace LightSvnBrowser
             Run("favorite preview resolves latest metadata and keeps alias", FavoriteLatestPreview);
             Run("favorite search matches names, tags, notes and paths", FavoriteSearch);
             Run("filename search uses stored index and directory boundary", FilenameSearch);
+            Run("repository headers sort every column and preserve selection without SVN", RepositoryColumnSorting);
+            Run("directory and search sorting uses real sizes and timestamps with global row order", EntryColumnSorting);
+            Run("favorite columns sort tags notes paths and retain independent schema preferences", FavoriteColumnSorting);
+            Run("history restores sorted arrows selection and originally unsorted snapshots", SortingHistory);
             Run("cancelled navigation cannot overwrite newer directory", NavigationRace);
             Run("switching to favorites cancels pending navigation", NavigationToFavorites);
             Run("data-directory shortcut keeps executable and quoted arguments", DataDirectoryShortcut);
@@ -628,6 +638,276 @@ namespace LightSvnBrowser
             }
         }
 
+        private static void AddSortRepositories(AppStore store)
+        {
+            Repository third = AddRepository(store, "sort-c", "Charlie", "Alpha group");
+            third.Url = "https://offline.invalid/b"; third.Username = "alpha";
+            Repository first = AddRepository(store, "sort-a", "Alpha", "Charlie group");
+            first.Url = "https://offline.invalid/c"; first.Username = "middle";
+            Repository second = AddRepository(store, "sort-b", "Bravo", "Bravo group");
+            second.Url = "https://offline.invalid/a"; second.Username = "zulu";
+        }
+
+        private static void AddSortFavorites(AppStore store, Repository repository)
+        {
+            store.Config.Favorites.Add(new Favorite { Id = "sort-fav-a", RepositoryId = repository.Id, Name = "Alpha reference", Path = "z/real-a.pdf", Tags = "zulu", Note = "bravo" });
+            store.Config.Favorites.Add(new Favorite { Id = "sort-fav-b", RepositoryId = repository.Id, Name = "Bravo reference", Path = "a/real-b.txt", Tags = "alpha", Note = "charlie" });
+            store.Config.Favorites.Add(new Favorite { Id = "sort-fav-c", RepositoryId = repository.Id, Name = "Zulu directory", Path = "m/real-c", Tags = "middle", Note = "alpha", IsDirectory = true });
+        }
+
+        private static List<SvnEntry> SortEntries()
+        {
+            const long Kibibyte = 1024L;
+            const long Mebibyte = Kibibyte * Kibibyte;
+            const long Gibibyte = Mebibyte * Kibibyte;
+            return new List<SvnEntry>
+            {
+                new SvnEntry { Name = SortLargeName, Path = "z/" + SortLargeName, Size = 10L * Gibibyte, Revision = "7", ModifiedUtc = new DateTime(2026, 11, 2, 12, 30, 45, DateTimeKind.Utc) },
+                new SvnEntry { Name = SortMediumName, Path = "a/" + SortMediumName, Size = 900L * Mebibyte, Revision = "7", ModifiedUtc = new DateTime(2026, 11, 2, 12, 30, 5, DateTimeKind.Utc) },
+                new SvnEntry { Name = SortSmallName, Path = "y/" + SortSmallName, Size = 2L * Kibibyte, Revision = "7", ModifiedUtc = new DateTime(2025, 1, 2, 1, 1, 0, DateTimeKind.Utc) },
+                new SvnEntry { Name = SortTinyName, Path = "b/" + SortTinyName, Size = 1000L, Revision = "7", ModifiedUtc = new DateTime(2024, 1, 2, 1, 1, 0, DateTimeKind.Utc) },
+                new SvnEntry { Name = SortThreeGbName, Path = "x/" + SortThreeGbName, Size = 3L * Gibibyte, Revision = "7", ModifiedUtc = new DateTime(2027, 1, 2, 1, 1, 0, DateTimeKind.Utc) },
+                new SvnEntry { Name = SortFolderName, Path = "c/" + SortFolderName, IsDirectory = true, Revision = "7", ModifiedUtc = new DateTime(2023, 1, 2, 1, 1, 0, DateTimeKind.Utc) }
+            };
+        }
+
+        private static string[] ColumnTitles(ListView list)
+        {
+            return list.Columns.Cast<ColumnHeader>().Select(column => column.Text).ToArray();
+        }
+
+        private static void AssertSortState(MainForm form, string[] titles, int column, bool descending)
+        {
+            ListView list = Field<ListView>(form, "files");
+            Assert(Field<int>(form, "sortColumn") == column && Field<bool>(form, "sortDescending") == descending, "Sort direction/column state is incorrect.");
+            for (int index = 0; index < titles.Length; index++)
+            {
+                string expected = titles[index] + (index == column ? (descending ? " ▼" : " ▲") : String.Empty);
+                Assert(list.Columns[index].Text == expected, "Sort arrow was lost or appeared on another column: " + index);
+            }
+        }
+
+        private static void SelectSortRow(MainForm form, ListViewItem selected)
+        {
+            bool previous = Field<bool>(form, "suppressSelectionPreview");
+            SetField(form, "suppressSelectionPreview", true);
+            try
+            {
+                foreach (ListViewItem row in Field<ListView>(form, "files").Items) row.Selected = false;
+                selected.Selected = true;
+                selected.Focused = true;
+            }
+            finally { SetField(form, "suppressSelectionPreview", previous); }
+        }
+
+        private static void AssertSortSelection(MainForm form, object tag, string previewText, int calls, AppStore store)
+        {
+            ListView list = Field<ListView>(form, "files");
+            Assert(list.SelectedItems.Count == 1 && Object.ReferenceEquals(list.SelectedItems[0].Tag, tag), "Sorting lost or replaced the selected row identity.");
+            Assert(Field<TextBox>(form, "preview").Text == previewText, "Sorting triggered or reset the preview.");
+            Assert(FakeCalls(store) == calls, "Sorting issued an SVN request.");
+        }
+
+        private static void AssertRepositoryOrder(ListView list, params string[] ids)
+        {
+            Assert(list.Items.Cast<ListViewItem>().Select(row => ((Repository)row.Tag).Id).SequenceEqual(ids), "Repository column order is incorrect.");
+        }
+
+        private static void AssertEntryOrder(ListView list, params string[] names)
+        {
+            Assert(list.Items.Cast<ListViewItem>().Select(row => ((SvnEntry)row.Tag.GetType().GetField("Entry").GetValue(row.Tag)).Name).SequenceEqual(names), "File/folder column order is incorrect.");
+        }
+
+        private static string FavoriteRowId(ListViewItem row)
+        {
+            return ((Favorite)row.Tag.GetType().GetField("Favorite").GetValue(row.Tag)).Id;
+        }
+
+        private static void AssertFavoriteOrder(ListView list, params string[] ids)
+        {
+            Assert(list.Items.Cast<ListViewItem>().Select(FavoriteRowId).SequenceEqual(ids), "Favorite column order is incorrect.");
+        }
+
+        private static void AssertTextColumnOrder(ListView list, int column, bool descending)
+        {
+            string[] actual = list.Items.Cast<ListViewItem>().Select(row => row.SubItems[column].Text).ToArray();
+            IEnumerable<string> ordered = actual.OrderBy(value => value, StringComparer.CurrentCultureIgnoreCase);
+            if (descending) ordered = ordered.Reverse();
+            Assert(actual.SequenceEqual(ordered), "Text/type column is not sorted in the selected direction.");
+        }
+
+        private static void RepositoryColumnSorting()
+        {
+            AppStore store = NewStore("sort-repositories");
+            AddSortRepositories(store);
+            using (MainForm form = OpenMain(store))
+            {
+                ListView list = Field<ListView>(form, "files");
+                string[] titles = ColumnTitles(list);
+                SelectSortRow(form, list.Items.Cast<ListViewItem>().Single(row => ((Repository)row.Tag).Id == "sort-b"));
+                object selected = list.SelectedItems[0].Tag;
+                string previewText = Field<TextBox>(form, "preview").Text;
+                string[][] expected = { new[] { "sort-a", "sort-b", "sort-c" }, new[] { "sort-c", "sort-b", "sort-a" }, new[] { "sort-b", "sort-c", "sort-a" }, new[] { "sort-c", "sort-a", "sort-b" } };
+                for (int column = 0; column < titles.Length; column++)
+                {
+                    if (column == 0)
+                        typeof(ListView).GetMethod("OnColumnClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(list, new object[] { new ColumnClickEventArgs(column) });
+                    else Call(form, "SortByColumn", column);
+                    AssertRepositoryOrder(list, expected[column]);
+                    AssertSortState(form, titles, column, false);
+                    AssertSortSelection(form, selected, previewText, 0, store);
+                    Call(form, "SortByColumn", column);
+                    AssertRepositoryOrder(list, expected[column].Reverse().ToArray());
+                    AssertSortState(form, titles, column, true);
+                    AssertSortSelection(form, selected, previewText, 0, store);
+                }
+            }
+        }
+
+        private static void EntryColumnSorting()
+        {
+            AppStore store = NewStore("sort-entries");
+            Repository repository = AddRepository(store, "sort-files", "Sort fixture", "Examples");
+            store.SaveIndex(new IndexSnapshot { RepositoryId = repository.Id, Revision = "7", UpdatedUtc = DateTime.UtcNow, Entries = SortEntries() });
+            using (MainForm form = OpenMain(store))
+            {
+                Pump((Task)Call(form, "NavigateAsync", repository, "sort-fixture"));
+                ListView list = Field<ListView>(form, "files");
+                Assert(list.Items.Count == SortEntries().Count, "Offline directory sort fixture did not load.");
+                string[] titles = ColumnTitles(list);
+                ListViewItem small = list.Items.Cast<ListViewItem>().Single(row => row.Text == SortSmallName);
+                SelectSortRow(form, small);
+                object selected = small.Tag;
+                Field<TextBox>(form, "preview").Text = "Keep the existing sorting preview.";
+                string previewText = Field<TextBox>(form, "preview").Text;
+                int calls = FakeCalls(store);
+                Call(form, "SortByColumn", 0);
+                AssertEntryOrder(list, SortLargeName, SortMediumName, SortSmallName, SortTinyName, SortThreeGbName, SortFolderName);
+                Call(form, "SortByColumn", 0);
+                AssertEntryOrder(list, SortFolderName, SortThreeGbName, SortTinyName, SortSmallName, SortMediumName, SortLargeName);
+                Call(form, "SortByColumn", 2);
+                AssertEntryOrder(list, SortFolderName, SortTinyName, SortSmallName, SortMediumName, SortThreeGbName, SortLargeName);
+                AssertSortState(form, titles, 2, false);
+                Call(form, "SortByColumn", 2);
+                AssertEntryOrder(list, SortLargeName, SortThreeGbName, SortMediumName, SortSmallName, SortTinyName, SortFolderName);
+                Call(form, "SortByColumn", 3);
+                AssertEntryOrder(list, SortFolderName, SortTinyName, SortSmallName, SortMediumName, SortLargeName, SortThreeGbName);
+                Assert(list.Items.Cast<ListViewItem>().Single(row => row.Text == SortLargeName).SubItems[3].Text == list.Items.Cast<ListViewItem>().Single(row => row.Text == SortMediumName).SubItems[3].Text,
+                    "Time fixture must have identical displayed minutes but different source seconds.");
+                Call(form, "SortByColumn", 3);
+                AssertEntryOrder(list, SortThreeGbName, SortLargeName, SortMediumName, SortSmallName, SortTinyName, SortFolderName);
+                AssertSortSelection(form, selected, previewText, calls, store);
+                Call(form, "SortByColumn", 1); AssertTextColumnOrder(list, 1, false);
+                Call(form, "SortByColumn", 1); AssertTextColumnOrder(list, 1, true);
+                Call(form, "SortByColumn", 3); Call(form, "SortByColumn", 3);
+                Field<ComboBox>(form, "scope").SelectedIndex = 1;
+                Field<TextBox>(form, "search").Text = "sort-";
+                Pump((Task)Call(form, "SearchAsync"));
+                AssertEntryOrder(list, SortThreeGbName, SortLargeName, SortMediumName, SortSmallName, SortTinyName, SortFolderName);
+                AssertSortState(form, titles, 3, true);
+                Assert(FakeCalls(store) == calls, "Indexed search or remembered ordering unexpectedly contacted SVN.");
+                Call(form, "SortByColumn", 4);
+                AssertEntryOrder(list, SortMediumName, SortTinyName, SortFolderName, SortThreeGbName, SortSmallName, SortLargeName);
+                Call(form, "SortByColumn", 4);
+                AssertEntryOrder(list, SortLargeName, SortSmallName, SortThreeGbName, SortFolderName, SortTinyName, SortMediumName);
+                AssertSortState(form, titles, 4, true);
+                Assert(FakeCalls(store) == calls, "Path sorting issued an SVN request.");
+            }
+        }
+
+        private static void FavoriteColumnSorting()
+        {
+            AppStore store = NewStore("sort-favorites");
+            AddSortRepositories(store);
+            AddSortFavorites(store, store.Config.Repositories[0]);
+            using (MainForm form = OpenMain(store))
+            {
+                string[] repositoryTitles = ColumnTitles(Field<ListView>(form, "files"));
+                Call(form, "SortByColumn", 1);
+                Call(form, "ShowFavorites", new object[] { null });
+                ListView list = Field<ListView>(form, "files");
+                string[] titles = ColumnTitles(list);
+                SelectSortRow(form, list.Items.Cast<ListViewItem>().Single(row => FavoriteRowId(row) == "sort-fav-b"));
+                object selected = list.SelectedItems[0].Tag;
+                string previewText = Field<TextBox>(form, "preview").Text;
+                int[] columns = { 0, 2, 3, 4 };
+                string[][] orders = { new[] { "sort-fav-a", "sort-fav-b", "sort-fav-c" }, new[] { "sort-fav-b", "sort-fav-c", "sort-fav-a" }, new[] { "sort-fav-c", "sort-fav-a", "sort-fav-b" }, new[] { "sort-fav-b", "sort-fav-c", "sort-fav-a" } };
+                for (int index = 0; index < columns.Length; index++)
+                {
+                    Call(form, "SortByColumn", columns[index]);
+                    AssertFavoriteOrder(list, orders[index]);
+                    AssertSortState(form, titles, columns[index], false);
+                    Call(form, "SortByColumn", columns[index]);
+                    AssertFavoriteOrder(list, orders[index].Reverse().ToArray());
+                    AssertSortState(form, titles, columns[index], true);
+                    AssertSortSelection(form, selected, previewText, 0, store);
+                }
+                Call(form, "SortByColumn", 1); AssertTextColumnOrder(list, 1, false);
+                Call(form, "SortByColumn", 1); AssertTextColumnOrder(list, 1, true);
+                string[] favoriteOrder = VisibleRows(list);
+                Call(form, "ShowRepositories", new object[] { null });
+                AssertSortState(form, repositoryTitles, 1, false);
+                AssertRepositoryOrder(list, "sort-c", "sort-b", "sort-a");
+                Call(form, "ShowFavorites", new object[] { null });
+                AssertSortState(form, titles, 1, true);
+                Assert(VisibleRows(list).SequenceEqual(favoriteOrder) && FakeCalls(store) == 0, "Changing schemas lost favorite ordering or contacted SVN.");
+            }
+        }
+
+        private static void SortingHistory()
+        {
+            AppStore store = NewStore("sort-history");
+            Repository repository = AddRepository(store, "sort-history", "Sort history", "Examples");
+            AddSortFavorites(store, repository);
+            store.SaveIndex(new IndexSnapshot { RepositoryId = repository.Id, Revision = "7", UpdatedUtc = DateTime.UtcNow, Entries = SortEntries() });
+            using (MainForm form = OpenMain(store))
+            {
+                Field<ComboBox>(form, "scope").SelectedIndex = 1;
+                Field<TextBox>(form, "search").Text = "sort-";
+                Pump((Task)Call(form, "SearchAsync"));
+                ListView list = Field<ListView>(form, "files");
+                string[] searchTitles = ColumnTitles(list);
+                Call(form, "SortByColumn", 3);
+                SelectSortRow(form, list.Items.Cast<ListViewItem>().Single(row => row.Text == SortSmallName));
+                string[] searchRows = VisibleRows(list);
+                Call(form, "ShowFavorites", new object[] { null });
+                string[] favoriteTitles = ColumnTitles(list);
+                Call(form, "SortByColumn", 2); Call(form, "SortByColumn", 2);
+                SelectSortRow(form, list.Items.Cast<ListViewItem>().Single(row => FavoriteRowId(row) == "sort-fav-b"));
+                string[] favoriteRows = VisibleRows(list);
+                Call(form, "GoBack");
+                AssertSortState(form, searchTitles, 3, false);
+                Assert(VisibleRows(list).SequenceEqual(searchRows) && list.SelectedItems.Count == 1 && list.SelectedItems[0].Text == SortSmallName,
+                    "Back lost sorted search rows or selected identity.");
+                Call(form, "GoForward");
+                AssertSortState(form, favoriteTitles, 2, true);
+                Assert(VisibleRows(list).SequenceEqual(favoriteRows) && list.SelectedItems.Count == 1 && FavoriteRowId(list.SelectedItems[0]) == "sort-fav-b",
+                    "Forward lost sorted favorite rows or selected identity.");
+                Assert(FakeCalls(store) == 0, "Sorting/history restoration issued an SVN request.");
+            }
+            AppStore unsortedStore = NewStore("sort-history-unsorted");
+            AddSortRepositories(unsortedStore);
+            AddSortFavorites(unsortedStore, unsortedStore.Config.Repositories[0]);
+            using (MainForm form = OpenMain(unsortedStore))
+            {
+                ListView list = Field<ListView>(form, "files");
+                string[] originalTitles = ColumnTitles(list);
+                string[] originalRows = VisibleRows(list);
+                SelectSortRow(form, list.Items.Cast<ListViewItem>().Single(row => ((Repository)row.Tag).Id == "sort-b"));
+                Call(form, "ShowFavorites", new object[] { null });
+                Call(form, "ShowRepositories", new object[] { null });
+                Call(form, "SortByColumn", 0);
+                Call(form, "GoBack"); Call(form, "GoBack");
+                AssertSortState(form, originalTitles, -1, false);
+                Assert(VisibleRows(list).SequenceEqual(originalRows) && ((Repository)list.SelectedItems[0].Tag).Id == "sort-b",
+                    "A later remembered sort corrupted the originally unsorted history snapshot.");
+                Call(form, "GoForward"); Call(form, "GoForward");
+                AssertSortState(form, originalTitles, 0, false);
+                AssertRepositoryOrder(list, "sort-a", "sort-b", "sort-c");
+                Assert(FakeCalls(unsortedStore) == 0, "Unsorted history restoration issued an SVN request.");
+            }
+        }
+
         private static void NavigationRace()
         {
             AppStore store = NewStore("navigation-race");
@@ -666,6 +946,15 @@ namespace LightSvnBrowser
             if (args[0] == "cat") { Console.Write(Payload); return 0; }
             if (args[0] == "info") { Console.Write("<?xml version=\"1.0\"?><info><entry kind=\"dir\" revision=\"7\" path=\"docs\" /></info>"); return 0; }
             string url = args[args.Length - 1];
+            if (url.IndexOf("/sort-fixture", StringComparison.Ordinal) >= 0)
+            {
+                Console.Write("<?xml version=\"1.0\"?><lists><list path=\"offline\">");
+                foreach (SvnEntry entry in SortEntries())
+                    Console.Write("<entry kind=\"" + (entry.IsDirectory ? "dir" : "file") + "\"><name>" + entry.Name + "</name><size>" + entry.Size.ToString(CultureInfo.InvariantCulture)
+                        + "</size><commit revision=\"7\"><author>offline</author><date>" + entry.ModifiedUtc.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture) + "</date></commit></entry>");
+                Console.Write("</list></lists>");
+                return 0;
+            }
             if (url.IndexOf("/failed", StringComparison.Ordinal) >= 0) { Console.Error.Write("svn: E170013: Offline fixture rejects this path."); return 1; }
             bool slow = url.IndexOf("/slow", StringComparison.Ordinal) >= 0;
             if (slow) Thread.Sleep(700);

@@ -23,6 +23,9 @@
 7. 顶部输入文件名关键词搜索，多个关键词用空格分隔；可选当前仓库、所有仓库或当前目录及子目录。在“我的收藏”中，搜索同时匹配名称、标签、备注和路径。
 8. 从搜索结果进入目录后，点击“后退”或按 Alt+Left 返回原结果；“前进”或 Alt+Right 可再回目录。结果顺序、关键词、范围、选中项、滚动位置和列宽都会恢复，不重新访问 SVN。“上一级”仍表示父目录。
 9. 在“设置 / 数据目录”的“界面字号 / pt”中调整字体大小，支持 8–16 pt、每次 0.5 pt，默认 9 pt，可恢复默认。保存后立即应用于主界面、列表、预览及对话框，并在下次启动时恢复；较大字号在屏幕空间不足时可滚动查看完整内容。
+10. 在仓库、目录、搜索结果和收藏列表中点击列头排序；首次点击升序，再次点击降序，列头用 ▲ / ▼ 提示当前方向。
+
+大小按实际字节数、修改时间按实际时间排序。手动排序时，文件夹与文件一同参与所选列的排序；未选择列头排序时，保留默认的目录优先顺序。排序后保持当前选中项，后退和前进也会恢复该视图的排序列与方向。同一次运行中，仓库、文件和收藏列表分别沿用各自的排序选择。列头排序作用于当前已展示的行；搜索超过 5,000 个匹配项时，仅对已展示的结果排序。
 
 第一次搜索时，仅扫描所选仓库的目录元数据并建立文件名索引，**不 checkout、不读取全部文件正文**。首次扫描耗时取决于目录数量和网络；可随时取消。初版索引按需手动更新，SVN 有新增或修改后点击“更新搜索索引”。
 
@@ -89,7 +92,7 @@ bash ./package.sh
 
 更新运行中的应用时，可先使用 `Build.ps1 -OutputFile work/release/LightSvnBrowser.exe` 构建暂存版本，并用 `Verify.ps1 -ApplicationExecutable work/release/LightSvnBrowser.exe` 验证后再替换。
 
-`package.cmd` / `package.sh` 默认构建并完成验证，然后生成 `dist/LightSvnBrowser-0.2.1-win-x64.zip`。包内使用明确的文件允许清单，不包含仓库配置、索引、日志或用户缓存。Windows 命令行使用 `.cmd`；`.sh` 调用 Windows PowerShell，不能在原生 Linux/macOS 上独立编译此 Windows 桌面程序。
+`package.cmd` / `package.sh` 默认构建并完成验证，然后生成 `dist/LightSvnBrowser-0.2.2-win-x64.zip`。包内使用明确的文件允许清单，不包含仓库配置、索引、日志或用户缓存。Windows 命令行使用 `.cmd`；`.sh` 调用 Windows PowerShell，不能在原生 Linux/macOS 上独立编译此 Windows 桌面程序。
 
 可通过 `-RuntimeArchive <运行时ZIP>` 复用已有的合法客户端压缩包，或使用 `-SvnBinDirectory <SVN客户端目录>` 指定来源；`-SkipRuntime` 生成依赖本机 SVN 的小型版本。验证测试需要完整的本地 SVN 工具（包括 `svnadmin`、`svnserve`）；`-SkipVerify` 可以显式跳过验证，生成的包会提示未通过本次打包检查。
 
@@ -103,7 +106,7 @@ bash ./package.sh
 
 功能与验证范围见 [初版验证与改动说明](docs/初版验证与改动说明.md)。连接失败、证书名称不匹配等问题见 [故障排查](docs/TROUBLESHOOTING.md)。
 
-搜索优化、历史导航与打包变化见 [版本记录](docs/RELEASE-NOTES.md)。
+列头排序、字号设置、搜索优化、历史导航与打包变化见 [版本记录](docs/RELEASE-NOTES.md)。
 
 ## 界面示例
 
