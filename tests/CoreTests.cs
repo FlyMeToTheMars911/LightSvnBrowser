@@ -60,6 +60,9 @@ public static class TestRunner
     {
         string root = Path.Combine(_testRoot, "settings");
         AppStore store = new AppStore(root);
+        Assert(store.Config.UiFontSize == UiFontSettings.DefaultSize, "new configuration defaults to nine point UI font");
+        const float preferredFontSize = 12.5F;
+        store.Config.UiFontSize = preferredFontSize;
         const string password = "Test only 密码 \" @ & 1092";
         string encrypted = store.Protect(password);
         Assert(encrypted.StartsWith("dpapi:"), "DPAPI prefix");
@@ -82,7 +85,24 @@ public static class TestRunner
         Assert(reloaded.Config.Favorites[0].Note == "第二次保存", "JSON Unicode round trip");
         Assert(reloaded.Unprotect(reloaded.Config.Repositories[0].ProtectedPassword) == password, "persisted DPAPI secret");
         Assert(reloaded.Config.Repositories[0].AllowIpCertificateNameMismatch, "certificate name exception JSON round trip");
+        Assert(reloaded.Config.UiFontSize == preferredFontSize, "fractional UI font size persists after reload");
         string before = File.ReadAllText(configPath);
+        float[] invalidFontSizes = { Single.NaN, Single.PositiveInfinity, Single.NegativeInfinity, UiFontSettings.MinimumSize - 0.5F, UiFontSettings.MaximumSize + 0.5F };
+        foreach (float invalid in invalidFontSizes)
+        {
+            store.Config.UiFontSize = invalid;
+            Expect<InvalidDataException>(delegate { store.Save(); }, "non-finite or out-of-range UI font rejected");
+            Assert(File.ReadAllText(configPath) == before, "invalid UI font save preserves existing settings file");
+        }
+        foreach (float endpoint in new[] { UiFontSettings.MinimumSize, UiFontSettings.MaximumSize })
+        {
+            store.Config.UiFontSize = endpoint;
+            store.Save();
+            Assert(new AppStore(root).Config.UiFontSize == endpoint, "UI font range endpoint is accepted");
+        }
+        store.Config.UiFontSize = preferredFontSize;
+        store.Save();
+        before = File.ReadAllText(configPath);
         File.WriteAllText(configPath, "{ broken json");
         Expect<InvalidDataException>(delegate { new AppStore(root); }, "corrupt settings fails without wipe");
         Assert(File.ReadAllText(configPath) == "{ broken json", "corrupt settings preserved");
@@ -93,6 +113,14 @@ public static class TestRunner
         File.WriteAllText(Path.Combine(legacyRoot, "settings.json"), "{\"Repositories\":[{\"Id\":\"legacy\",\"Name\":\"Legacy\",\"Url\":\"https://example.invalid/svn\"}],\"Favorites\":[]}");
         AppStore legacy = new AppStore(legacyRoot);
         Assert(!legacy.Config.Repositories[0].AllowIpCertificateNameMismatch, "legacy configuration without certificate flag remains disabled");
+        Assert(legacy.Config.UiFontSize == UiFontSettings.DefaultSize, "legacy JSON without UI font uses nine point default");
+        string invalidFontRoot = Path.Combine(_testRoot, "invalid-font-settings");
+        Directory.CreateDirectory(invalidFontRoot);
+        string invalidFontJson = "{\"Repositories\":[],\"Favorites\":[],\"UiFontSize\":17}";
+        string invalidFontPath = Path.Combine(invalidFontRoot, "settings.json");
+        File.WriteAllText(invalidFontPath, invalidFontJson);
+        Expect<InvalidDataException>(delegate { new AppStore(invalidFontRoot); }, "invalid font in JSON rejected on load");
+        Assert(File.ReadAllText(invalidFontPath) == invalidFontJson, "invalid font JSON remains intact for repair");
     }
 
     private static void TestUrls()

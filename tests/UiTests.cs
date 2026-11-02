@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -17,6 +18,10 @@ namespace LightSvnBrowser
     internal static class UiTests
     {
         private const string Payload = "offline preview content";
+        private const float DefaultUiFontSize = 9F;
+        private const float MaximumUiFontSize = 16F;
+        private const float FractionalUiFontSize = 12.5F;
+        private const float FontPointTolerance = 0.15F;
         private static int passed;
         private static int failed;
         private static string runDirectory;
@@ -57,6 +62,10 @@ namespace LightSvnBrowser
             Run("IP certificate exception is cleared for DNS and non-HTTPS URLs", RepositoryIpCertificateUrlChanges);
             Run("favorite dialog keeps identity and normalizes tags", FavoriteDialogSave);
             Run("settings returns directory changes without moving data", SettingsDialogSave);
+            Run("font settings load, return fractional values and cancel without changing configuration", SettingsFontSize);
+            Run("main font changes scale all text, preserve navigation and restore without accumulation", MainFontSize);
+            Run("saved font size is restored when the main window is reopened", MainFontSizeRestart);
+            Run("font size endpoints render the main window and all dialogs without clipped controls", FontSizeScreenshots);
             Run("nested groups contain descendants without matching sibling prefixes", NestedGroups);
             Run("favorite aliases preserve real file names", FavoriteAlias);
             Run("favorite preview resolves latest metadata and keeps alias", FavoriteLatestPreview);
@@ -197,7 +206,7 @@ namespace LightSvnBrowser
                 Field<TextBox>(dialog, "_url").Text = "https://192.0.2.23/svn/docs/";
                 Assert(option.Enabled && !option.Checked, "IP URL should enable the option without automatically opting in.");
                 option.Checked = true;
-                TableLayoutPanel fields = dialog.Controls.OfType<TableLayoutPanel>().First();
+                TableLayoutPanel fields = ControlTree(dialog).OfType<TableLayoutPanel>().First();
                 Assert(fields.Controls.Cast<Control>().All(c => c.Bottom <= fields.ClientSize.Height), "Repository dialog clips a field or hint.");
                 using (Bitmap bitmap = new Bitmap(dialog.Width, dialog.Height))
                 {
@@ -266,6 +275,242 @@ namespace LightSvnBrowser
             {
                 Call(dialog, "SaveClicked", null, EventArgs.Empty);
                 Assert(String.IsNullOrEmpty(dialog.RequestedDataDirectory), "Unchanged data directory was reported as changed.");
+            }
+        }
+
+        private static void SettingsFontSize()
+        {
+            const decimal MinimumFontSize = 8M;
+            const decimal MaximumFontSize = 16M;
+            const decimal FontIncrement = 0.5M;
+            const decimal SavedFontSize = 14.5M;
+            AppStore store = NewStore("font-settings");
+            store.Config.UiFontSize = FractionalUiFontSize;
+            store.Save();
+            string settingsPath = Path.Combine(store.DataDirectory, "settings.json");
+            string unchangedSettings = File.ReadAllText(settingsPath);
+            using (SettingsDialog dialog = new SettingsDialog(store))
+            {
+                OpenOffscreen(dialog);
+                NumericUpDown size = Field<NumericUpDown>(dialog, "_uiFontSize");
+                Assert(size.Value == (decimal)FractionalUiFontSize, "Settings did not load the saved fractional font size.");
+                Assert(size.Minimum == MinimumFontSize && size.Maximum == MaximumFontSize && size.Increment == FontIncrement && size.DecimalPlaces == 1,
+                    "Font size bounds, half-point increment or decimal display changed.");
+                AssertNear(dialog.Font.SizeInPoints, FractionalUiFontSize, "Settings did not use the current application font size.");
+                Button restore = ControlTree(dialog).OfType<Button>().Single(button => button.Text == "恢复默认");
+                size.Value = MaximumFontSize;
+                restore.PerformClick();
+                Assert(size.Value == (decimal)DefaultUiFontSize, "Restore default did not reset the font-size input.");
+                Assert(store.Config.UiFontSize == FractionalUiFontSize && File.ReadAllText(settingsPath) == unchangedSettings,
+                    "Editing or restoring defaults changed saved settings before Save.");
+                size.Value = SavedFontSize;
+                Call(dialog, "SaveClicked", null, EventArgs.Empty);
+                Assert(dialog.DialogResult == DialogResult.OK && dialog.UiFontSize == (float)SavedFontSize, "Saved settings did not return the selected fractional size.");
+                Assert(store.Config.UiFontSize == FractionalUiFontSize && File.ReadAllText(settingsPath) == unchangedSettings,
+                    "Settings dialog wrote application configuration directly.");
+            }
+            using (SettingsDialog dialog = new SettingsDialog(store))
+            {
+                OpenOffscreen(dialog);
+                Field<NumericUpDown>(dialog, "_uiFontSize").Value = MaximumFontSize;
+                dialog.DialogResult = DialogResult.Cancel;
+                dialog.Close();
+                Assert(store.Config.UiFontSize == FractionalUiFontSize && File.ReadAllText(settingsPath) == unchangedSettings,
+                    "Cancelling the font-size edit changed memory or disk configuration.");
+            }
+        }
+
+        private sealed class FontSnapshot
+        {
+            public float Points;
+            public string Family;
+            public FontStyle Style;
+        }
+
+        private static IEnumerable<Control> ControlTree(Control root)
+        {
+            yield return root;
+            foreach (Control child in root.Controls)
+                foreach (Control descendant in ControlTree(child)) yield return descendant;
+        }
+
+        private static Dictionary<Control, FontSnapshot> SnapshotFonts(Form form)
+        {
+            return ControlTree(form).ToDictionary(control => control, control => new FontSnapshot
+            {
+                Points = control.Font.SizeInPoints,
+                Family = control.Font.FontFamily.Name,
+                Style = control.Font.Style
+            });
+        }
+
+        private static void AssertNear(float actual, float expected, string message)
+        {
+            Assert(Math.Abs(actual - expected) <= FontPointTolerance,
+                message + " Expected=" + expected.ToString(CultureInfo.InvariantCulture) + ", actual=" + actual.ToString(CultureInfo.InvariantCulture));
+        }
+
+        private static void AssertScaledFonts(Dictionary<Control, FontSnapshot> baseline, float ratio)
+        {
+            foreach (KeyValuePair<Control, FontSnapshot> item in baseline)
+            {
+                AssertNear(item.Key.Font.SizeInPoints, item.Value.Points * ratio, "Incorrect font scale for " + item.Key.GetType().Name + " / " + item.Key.AccessibleName);
+                Assert(item.Key.Font.FontFamily.Name == item.Value.Family && item.Key.Font.Style == item.Value.Style,
+                    "Font scaling changed font family/style for " + item.Key.GetType().Name);
+            }
+        }
+
+        private static void MainFontSize()
+        {
+            AppStore store = NewStore("font-main");
+            PrepareHistorySearch(store);
+            using (MainForm form = OpenMain(store))
+            {
+                TextBox query = Field<TextBox>(form, "search");
+                ListView list = Field<ListView>(form, "files");
+                TreeView navigation = Field<TreeView>(form, "navigation");
+                TextBox preview = Field<TextBox>(form, "preview");
+                query.Text = "Target folder";
+                Field<ComboBox>(form, "scope").SelectedIndex = 1;
+                Pump((Task)Call(form, "SearchAsync"));
+                SetField(form, "suppressSelectionPreview", true);
+                list.Items[65].Selected = true;
+                list.Items[65].Focused = true;
+                list.TopItem = list.Items[50];
+                SetField(form, "suppressSelectionPreview", false);
+                Call(form, "ShowRepositories", "Temporary font history view");
+                Call(form, "GoBack");
+                preview.Text = "Font preview: 中文 / ASCII / 12.5 pt\r\nThe text must remain after changing the font.";
+                string previewText = preview.Text;
+                string[] expectedRows = VisibleRows(list);
+                int selected = list.SelectedIndices[0];
+                int topIndex = list.TopItem.Index;
+                int backDepth = HistoryCount(form, "backHistory");
+                int forwardDepth = HistoryCount(form, "forwardHistory");
+                string addressText = Field<TextBox>(form, "address").Text;
+                Dictionary<Control, FontSnapshot> baseline = SnapshotFonts(form);
+                int initialTreeHeight = navigation.ItemHeight;
+                int initialBackHeight = Field<Button>(form, "back").Height;
+                Action assertView = delegate
+                {
+                    Assert(VisibleRows(list).SequenceEqual(expectedRows), "Font changes replaced or reordered result rows.");
+                    Assert(list.SelectedIndices.Count == 1 && list.SelectedIndices[0] == selected, "Font changes lost the selected search result.");
+                    Assert(list.TopItem.Index == topIndex, "Font changes lost the list scroll position.");
+                    Assert(HistoryCount(form, "backHistory") == backDepth && HistoryCount(form, "forwardHistory") == forwardDepth,
+                        "Font changes added, cleared or replaced navigation history.");
+                    Assert(query.Text == "Target folder" && Field<ComboBox>(form, "scope").SelectedIndex == 1 && Field<TextBox>(form, "address").Text == addressText,
+                        "Font changes lost the current search context.");
+                    Assert(preview.Text == previewText, "Font changes reset preview contents: " + preview.Text);
+                    Assert(FakeCalls(store) == 0, "Font changes unexpectedly contacted SVN.");
+                };
+                for (int cycle = 0; cycle < 2; cycle++)
+                {
+                    Call(form, "ApplyUiFontSize", FractionalUiFontSize);
+                    Application.DoEvents();
+                    AssertScaledFonts(baseline, FractionalUiFontSize / DefaultUiFontSize);
+                    Assert(navigation.ItemHeight >= navigation.Font.Height, "Large navigation font is clipped by its row height.");
+                    Assert(list.GetItemRect(0).Height >= list.Font.Height, "Large list font is clipped by its row height.");
+                    assertView();
+                    Dictionary<Control, FontSnapshot> applied = SnapshotFonts(form);
+                    int appliedTreeHeight = navigation.ItemHeight;
+                    Call(form, "ApplyUiFontSize", FractionalUiFontSize);
+                    AssertScaledFonts(applied, 1F);
+                    Assert(navigation.ItemHeight == appliedTreeHeight, "Applying the same font size accumulated row scaling.");
+                    Call(form, "ApplyUiFontSize", DefaultUiFontSize);
+                    Application.DoEvents();
+                    AssertScaledFonts(baseline, 1F);
+                    Assert(navigation.ItemHeight == initialTreeHeight && Math.Abs(Field<Button>(form, "back").Height - initialBackHeight) <= 1,
+                        "Returning to the default font did not restore control dimensions.");
+                    assertView();
+                }
+                Call(form, "GoForward");
+                Assert(Field<Label>(form, "pageTitle").Text == "Temporary font history view", "Font edits damaged the saved forward view.");
+                Call(form, "GoBack");
+                Assert(VisibleRows(list).SequenceEqual(expectedRows) && list.SelectedIndices.Count == 1 && list.SelectedIndices[0] == selected,
+                    "Navigation after font edits did not restore the prior rows and selection.");
+            }
+        }
+
+        private static void MainFontSizeRestart()
+        {
+            AppStore store = NewStore("font-restart");
+            using (MainForm form = OpenMain(store))
+            {
+                Call(form, "ApplyUiFontSize", FractionalUiFontSize);
+                AssertNear(form.Font.SizeInPoints, FractionalUiFontSize, "Main window did not apply the selected size immediately.");
+            }
+            AppStore reloaded = new AppStore(store.DataDirectory);
+            Assert(reloaded.Config.UiFontSize == FractionalUiFontSize, "Selected font size did not persist to application settings.");
+            using (MainForm reopened = OpenMain(reloaded))
+            {
+                AssertNear(reopened.Font.SizeInPoints, FractionalUiFontSize, "Reopened main window did not restore the saved size.");
+                AssertNear(Field<TreeView>(reopened, "navigation").Font.SizeInPoints, FractionalUiFontSize, "Reopened navigation did not restore the saved size.");
+                AssertNear(Field<ListView>(reopened, "files").Font.SizeInPoints, FractionalUiFontSize, "Reopened list did not restore the saved size.");
+                AssertNear(Field<TextBox>(reopened, "preview").Font.SizeInPoints, FractionalUiFontSize, "Reopened preview did not restore the saved size.");
+            }
+        }
+
+        private static void FontSizeScreenshots()
+        {
+            string screenshotDirectory = Path.Combine(runDirectory, "font-screenshots");
+            Directory.CreateDirectory(screenshotDirectory);
+            List<string> layoutIssues = new List<string>();
+            foreach (float size in new[] { DefaultUiFontSize, MaximumUiFontSize })
+            {
+                AppStore store = NewStore("font-endpoint");
+                store.Config.UiFontSize = size;
+                string suffix = size.ToString("0.#", CultureInfo.InvariantCulture);
+                using (MainForm main = OpenMain(store))
+                {
+                    main.RenderDemo();
+                    SaveFontScreenshot(main, size, Path.Combine(screenshotDirectory, "main-font-" + suffix + ".png"), layoutIssues);
+                }
+                Repository repository = new Repository { Id = "font-repository", Name = "示例文档仓库", Group = "示例资料/产品", Url = "https://192.0.2.23/svn/docs", Username = "reader" };
+                using (RepositoryDialog dialog = new RepositoryDialog(store, repository, new[] { "示例资料/产品" }))
+                {
+                    OpenOffscreen(dialog);
+                    SaveFontScreenshot(dialog, size, Path.Combine(screenshotDirectory, "repository-font-" + suffix + ".png"), layoutIssues);
+                }
+                Favorite favorite = new Favorite { Id = "font-favorite", RepositoryId = repository.Id, Name = "常用配置文档", Path = "设计/配置说明.md", Tags = "常用,参数", Note = "保存常用入口，便于后续核对。\r\n第二行备注用于检查大字号。" };
+                using (FavoriteDialog dialog = new FavoriteDialog(favorite, size))
+                {
+                    OpenOffscreen(dialog);
+                    SaveFontScreenshot(dialog, size, Path.Combine(screenshotDirectory, "favorite-font-" + suffix + ".png"), layoutIssues);
+                }
+                using (SettingsDialog dialog = new SettingsDialog(store))
+                {
+                    OpenOffscreen(dialog);
+                    SaveFontScreenshot(dialog, size, Path.Combine(screenshotDirectory, "settings-font-" + suffix + ".png"), layoutIssues);
+                }
+            }
+            Console.WriteLine("Font screenshots: " + screenshotDirectory);
+            Assert(layoutIssues.Count == 0, String.Join(Environment.NewLine, layoutIssues));
+        }
+
+        private static void SaveFontScreenshot(Form form, float size, string path, List<string> layoutIssues)
+        {
+            AssertNear(form.Font.SizeInPoints, size, "Endpoint window did not use the requested font size.");
+            UiTypography.Apply(form, size);
+            Application.DoEvents();
+            using (Bitmap bitmap = new Bitmap(form.Width, form.Height))
+            {
+                form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
+                bitmap.Save(path);
+            }
+            foreach (Control control in ControlTree(form))
+            {
+                if (!control.Visible || control.Parent == null || control.Parent is NumericUpDown) continue;
+                const int EdgeTolerance = 3;
+                ScrollableControl scrollParent = control.Parent as ScrollableControl;
+                bool scrollCanvas = scrollParent != null && scrollParent.AutoScroll;
+                if (!scrollCanvas && (control.Right > control.Parent.ClientSize.Width + EdgeTolerance || control.Bottom > control.Parent.ClientSize.Height + EdgeTolerance))
+                    layoutIssues.Add("Control extends beyond its parent in " + Path.GetFileName(path) + ": " + control.GetType().Name + " " + control.Bounds
+                        + " / parent=" + control.Parent.GetType().Name + " " + control.Parent.ClientSize + " / " + control.Text);
+                Button button = control as Button;
+                if (button == null) continue;
+                Size textSize = TextRenderer.MeasureText(button.Text, button.Font, Size.Empty, TextFormatFlags.NoPadding);
+                if (button.ClientSize.Height < textSize.Height || button.ClientSize.Width < textSize.Width)
+                    layoutIssues.Add("Button text is clipped in " + Path.GetFileName(path) + ": " + button.Text);
             }
         }
 

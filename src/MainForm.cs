@@ -128,6 +128,7 @@ namespace LightSvnBrowser
             BuildLayout();
             BuildNavigation(null);
             ShowRepositories();
+            UiTypography.Apply(this, store.Config.UiFontSize);
             KeyDown += delegate(object sender, KeyEventArgs args)
             {
                 if (args.Alt && args.KeyCode == Keys.Left) { args.SuppressKeyPress = true; GoBack(); }
@@ -147,6 +148,7 @@ namespace LightSvnBrowser
             root.Dock = DockStyle.Fill;
             root.RowCount = 4;
             root.ColumnCount = 1;
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             root.Margin = Padding.Empty;
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
@@ -164,7 +166,12 @@ namespace LightSvnBrowser
             header.Controls.Add(title);
             header.Controls.Add(subtitle);
             header.Controls.Add(settings);
-            header.Resize += delegate { settings.Location = new Point(header.ClientSize.Width - settings.Width - 20, 19); };
+            header.Resize += delegate
+            {
+                if (UiTypography.IsApplying(this)) return;
+                float ratio = Font.SizeInPoints / UiFontSettings.DefaultSize;
+                settings.Location = new Point(header.ClientSize.Width - settings.Width - (int)Math.Round(20 * ratio), (int)Math.Round(19 * ratio));
+            };
             settings.Click += delegate { ShowSettings(); };
             root.Controls.Add(header, 0, 0);
 
@@ -200,6 +207,7 @@ namespace LightSvnBrowser
             SplitContainer outer = new SplitContainer { Size = new Size(1280, 650), Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1, SplitterDistance = 246, Panel1MinSize = 205, Panel2MinSize = 700, SplitterWidth = 1, BackColor = Color.FromArgb(226, 232, 240), Margin = Padding.Empty };
             root.Controls.Add(outer, 0, 2);
             TableLayoutPanel sidebar = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, Padding = new Padding(14), BackColor = Color.FromArgb(248, 250, 252), Margin = Padding.Empty };
+            sidebar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             sidebar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
@@ -228,6 +236,7 @@ namespace LightSvnBrowser
             outer.Panel1.Controls.Add(sidebar);
 
             TableLayoutPanel workspace = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, BackColor = Color.White, Padding = new Padding(18, 10, 18, 0), Margin = Padding.Empty };
+            workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             workspace.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             workspace.RowStyles.Add(new RowStyle(SizeType.Absolute, 39));
             workspace.RowStyles.Add(new RowStyle(SizeType.Absolute, 27));
@@ -300,6 +309,7 @@ namespace LightSvnBrowser
             content.Panel1.Controls.Add(files);
 
             TableLayoutPanel detail = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(15, 8, 4, 10), BackColor = Color.FromArgb(248, 250, 252) };
+            detail.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
             detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
@@ -334,7 +344,8 @@ namespace LightSvnBrowser
             content.Panel2.Controls.Add(detail);
             content.SizeChanged += delegate
             {
-                const int preferredDetailWidth = 300;
+                if (UiTypography.IsApplying(this)) return;
+                int preferredDetailWidth = (int)Math.Round(300 * Font.SizeInPoints / UiFontSettings.DefaultSize);
                 if (content.ClientSize.Width > content.Panel1MinSize + content.Panel2MinSize + content.SplitterWidth)
                     content.SplitterDistance = Math.Max(content.Panel1MinSize, content.ClientSize.Width - preferredDetailWidth - content.SplitterWidth);
             };
@@ -519,7 +530,7 @@ namespace LightSvnBrowser
             suppressSelectionPreview = true;
             files.Items.Clear();
             files.Columns.Clear();
-            for (int index = 0; index < names.Length; index++) files.Columns.Add(names[index], widths[index]);
+            for (int index = 0; index < names.Length; index++) files.Columns.Add(names[index], (int)Math.Round(widths[index] * Font.SizeInPoints / UiFontSettings.DefaultSize));
             suppressSelectionPreview = previousSuppression;
         }
 
@@ -611,8 +622,9 @@ namespace LightSvnBrowser
             finally { restoringHistory = false; UpdateActions(); }
         }
 
-        private void RestoreViewPosition(NavigationState view)
+        private void RestoreViewPosition(NavigationState view, bool updateDetails = true)
         {
+            bool previousSuppression = suppressSelectionPreview;
             suppressSelectionPreview = true;
             try
             {
@@ -622,14 +634,14 @@ namespace LightSvnBrowser
                     if (view.SelectedKey != null && ItemKey(row.Tag) == view.SelectedKey) { row.Selected = true; row.Focused = true; break; }
                 if (files.Items.Count > 0) files.TopItem = files.Items[Math.Min(Math.Max(view.TopIndex, 0), files.Items.Count - 1)];
                 FileItem selected = SelectedFile();
-                if (selected != null)
+                if (selected != null && updateDetails)
                 {
                     detailTitle.Text = selected.Favorite == null ? selected.Entry.Name : selected.Favorite.Name;
                     detailMeta.Text = selected.Repository.Name + "\n" + selected.Entry.Path;
                     SetPreviewText("已恢复上次列表和选择位置。\r\n双击可临时查看，或继续选择其他搜索结果。");
                 }
             }
-            finally { suppressSelectionPreview = false; }
+            finally { suppressSelectionPreview = previousSuppression; }
         }
 
         private void SelectNavigationForView(NavigationState view)
@@ -912,7 +924,7 @@ namespace LightSvnBrowser
                     SetPreviewText(content);
                     using (Form viewer = new Form { Text = "临时查看（只读） · " + item.Entry.Name, Size = new Size(1000, 740), StartPosition = FormStartPosition.CenterParent, Font = Font })
                     {
-                        viewer.Controls.Add(new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 11F), Text = content, BackColor = Color.White });
+                        viewer.Controls.Add(new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 11F * store.Config.UiFontSize / UiFontSettings.DefaultSize), Text = content, BackColor = Color.White });
                         viewer.ShowDialog(this);
                     }
                 }
@@ -969,7 +981,7 @@ namespace LightSvnBrowser
             if (item == null) return;
             Favorite existing = store.Config.Favorites.FirstOrDefault(f => f.RepositoryId == item.Repository.Id && f.Path == item.Entry.Path);
             Favorite draft = existing ?? new Favorite { Id = Guid.NewGuid().ToString("N"), RepositoryId = item.Repository.Id, Path = item.Entry.Path, Name = item.Entry.Name, IsDirectory = item.Entry.IsDirectory, Tags = String.Empty, Note = String.Empty };
-            using (FavoriteDialog dialog = new FavoriteDialog(draft))
+            using (FavoriteDialog dialog = new FavoriteDialog(draft, store.Config.UiFontSize))
             {
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
                 if (existing != null) store.Config.Favorites[store.Config.Favorites.IndexOf(existing)] = dialog.Result;
@@ -1015,7 +1027,7 @@ namespace LightSvnBrowser
                     store.Config.SvnExecutable = dialog.SvnExecutable;
                     store.Config.CacheLimitMb = dialog.CacheLimitMb;
                     store.Config.CacheDays = dialog.CacheDays;
-                    store.Save();
+                    ApplyUiFontSize(dialog.UiFontSize);
                     store.CleanupCache();
                     service = new SvnService(store, executable);
                     searchEngine = new FilenameSearchEngine(store, service);
@@ -1025,6 +1037,29 @@ namespace LightSvnBrowser
                 }
                 catch (Exception error) { ShowError(error); }
             }
+        }
+
+        private void ApplyUiFontSize(float fontSize)
+        {
+            float previous = store.Config.UiFontSize;
+            store.Config.UiFontSize = fontSize;
+            try { store.Save(); }
+            catch { store.Config.UiFontSize = previous; throw; }
+            CaptureViewPosition();
+            CancelPreview();
+            bool previousSuppression = suppressSelectionPreview;
+            suppressSelectionPreview = true;
+            try
+            {
+                UiTypography.Apply(this, fontSize);
+                float ratio = fontSize / previous;
+                foreach (NavigationState view in backHistory.Concat(forwardHistory).Concat(currentView == null ? Enumerable.Empty<NavigationState>() : new[] { currentView }))
+                    if (view.ColumnWidths != null)
+                        for (int index = 0; index < view.ColumnWidths.Length; index++) view.ColumnWidths[index] = (int)Math.Round(view.ColumnWidths[index] * ratio);
+                if (currentView != null) RestoreViewPosition(currentView, false);
+            }
+            finally { suppressSelectionPreview = previousSuppression; }
+            store.Log("ui.font.changed", "size_pt=" + fontSize.ToString(CultureInfo.InvariantCulture));
         }
 
         private void SwitchDataDirectory(string target)
@@ -1038,6 +1073,7 @@ namespace LightSvnBrowser
                 next.Config.CacheDays = store.Config.CacheDays;
                 next.Config.CacheLimitMb = store.Config.CacheLimitMb;
                 next.Config.SvnExecutable = store.Config.SvnExecutable;
+                next.Config.UiFontSize = store.Config.UiFontSize;
                 next.Save();
             }
             string exe = Application.ExecutablePath;

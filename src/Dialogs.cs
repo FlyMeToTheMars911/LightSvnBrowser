@@ -68,7 +68,6 @@ namespace LightSvnBrowser
             hint.Text = text;
             hint.AutoSize = true;
             hint.ForeColor = Muted;
-            hint.MaximumSize = new Size(480, 0);
             hint.Margin = new Padding(0, 0, 0, 14);
             table.Controls.Add(hint, 1, row);
         }
@@ -123,9 +122,9 @@ namespace LightSvnBrowser
             TableLayoutPanel panel = new TableLayoutPanel();
             panel.ColumnCount = 2;
             panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86F));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 104F));
             panel.RowCount = 1;
-            panel.Height = 30;
+            panel.Height = 38;
             panel.Margin = Padding.Empty;
             field.Dock = DockStyle.Fill;
             field.Margin = new Padding(0, 2, 8, 0);
@@ -231,6 +230,7 @@ namespace LightSvnBrowser
             save.Click += SaveClicked;
             DialogStyle.AddButtons(this, save);
             Shown += delegate { _name.Focus(); };
+            UiTypography.Apply(this, store.Config.UiFontSize);
         }
 
         private void SaveClicked(object sender, EventArgs args)
@@ -354,7 +354,7 @@ namespace LightSvnBrowser
 
         public Favorite Result { get; private set; }
 
-        public FavoriteDialog(Favorite existing)
+        public FavoriteDialog(Favorite existing, float uiFontSize = UiFontSettings.DefaultSize)
         {
             if (existing == null) throw new ArgumentNullException("existing");
             _original = existing;
@@ -381,6 +381,7 @@ namespace LightSvnBrowser
             save.Click += SaveClicked;
             DialogStyle.AddButtons(this, save);
             Shown += delegate { _name.Focus(); _name.SelectAll(); };
+            UiTypography.Apply(this, uiFontSize);
         }
 
         private void SaveClicked(object sender, EventArgs args)
@@ -426,17 +427,19 @@ namespace LightSvnBrowser
         private readonly TextBox _svnExecutable;
         private readonly NumericUpDown _cacheLimit;
         private readonly NumericUpDown _cacheDays;
+        private readonly NumericUpDown _uiFontSize;
 
         public string RequestedDataDirectory { get; private set; }
         public string SvnExecutable { get; private set; }
         public int CacheLimitMb { get; private set; }
         public int CacheDays { get; private set; }
+        public float UiFontSize { get; private set; }
 
         public SettingsDialog(AppStore store)
         {
             if (store == null) throw new ArgumentNullException("store");
             _store = store;
-            DialogStyle.Apply(this, "设置", new Size(696, 390));
+            DialogStyle.Apply(this, "设置", new Size(696, 470));
             TableLayoutPanel fields = DialogStyle.CreateFields();
             _dataDirectory = DialogStyle.TextField(store.DataDirectory, 0);
             _dataDirectory.ReadOnly = true;
@@ -471,10 +474,25 @@ namespace LightSvnBrowser
             DialogStyle.AddField(fields, "缓存上限 / MB", _cacheLimit);
             DialogStyle.AddField(fields, "保留天数 / 天", _cacheDays);
             DialogStyle.AddHint(fields, "仅缓存按需打开的文件。启动或查看文件时自动清理过期及超额缓存。");
+            _uiFontSize = new NumericUpDown();
+            _uiFontSize.Minimum = (decimal)UiFontSettings.MinimumSize;
+            _uiFontSize.Maximum = (decimal)UiFontSettings.MaximumSize;
+            _uiFontSize.DecimalPlaces = 1;
+            _uiFontSize.Increment = 0.5M;
+            _uiFontSize.Value = (decimal)Math.Max(UiFontSettings.MinimumSize, Math.Min(UiFontSettings.MaximumSize, store.Config.UiFontSize));
+            _uiFontSize.TabIndex = 0;
+            Button resetFont = DialogStyle.Button("恢复默认", false);
+            resetFont.TabIndex = 1;
+            resetFont.Click += delegate { _uiFontSize.Value = (decimal)UiFontSettings.DefaultSize; };
+            TableLayoutPanel fontPanel = DialogStyle.WithAction(_uiFontSize, resetFont);
+            fontPanel.TabIndex = 4;
+            DialogStyle.AddField(fields, "界面字号 / pt", fontPanel);
+            DialogStyle.AddHint(fields, "字号范围 8–16 pt，默认 9 pt。保存后立即应用到主窗口及对话框。");
             Controls.Add(fields);
             Button save = DialogStyle.Button("保存", true);
             save.Click += SaveClicked;
             DialogStyle.AddButtons(this, save);
+            UiTypography.Apply(this, store.Config.UiFontSize);
         }
 
         private void ChooseDataDirectory(object sender, EventArgs args)
@@ -531,6 +549,7 @@ namespace LightSvnBrowser
             SvnExecutable = executable;
             CacheLimitMb = Decimal.ToInt32(_cacheLimit.Value);
             CacheDays = Decimal.ToInt32(_cacheDays.Value);
+            UiFontSize = Decimal.ToSingle(_uiFontSize.Value);
             DialogResult = DialogResult.OK;
             Close();
         }

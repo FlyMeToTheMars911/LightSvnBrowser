@@ -40,6 +40,13 @@ namespace LightSvnBrowser
         [DataMember] public bool IsDirectory { get; set; }
     }
 
+    public static class UiFontSettings
+    {
+        public const float DefaultSize = 9F;
+        public const float MinimumSize = 8F;
+        public const float MaximumSize = 16F;
+    }
+
     [DataContract]
     public sealed class AppConfig
     {
@@ -49,6 +56,7 @@ namespace LightSvnBrowser
         [DataMember] public int CacheLimitMb { get; set; }
         [DataMember] public int CacheDays { get; set; }
         [DataMember] public string SvnExecutable { get; set; }
+        [DataMember] public float UiFontSize { get; set; }
         [OnDeserializing] private void BeforeDeserialize(StreamingContext context) { SetDefaults(); }
         private void SetDefaults()
         {
@@ -57,6 +65,7 @@ namespace LightSvnBrowser
             CacheLimitMb = 256;
             CacheDays = 7;
             SvnExecutable = String.Empty;
+            UiFontSize = UiFontSettings.DefaultSize;
         }
     }
 
@@ -152,6 +161,8 @@ namespace LightSvnBrowser
         {
             if (Config == null || Config.Repositories == null || Config.Favorites == null)
                 throw new InvalidDataException("配置中的仓库或收藏列表无效。");
+            if (Single.IsNaN(Config.UiFontSize) || Single.IsInfinity(Config.UiFontSize) || Config.UiFontSize < UiFontSettings.MinimumSize || Config.UiFontSize > UiFontSettings.MaximumSize)
+                throw new InvalidDataException("界面字号须为 8 至 16 磅的有效数值。");
             if (Config.CacheLimitMb < 1 || Config.CacheLimitMb > MaxCacheMb || Config.CacheDays < 1 || Config.CacheDays > MaxCacheDays)
                 throw new InvalidDataException("缓存容量须为 1 至 16384 MB，保留天数须为 1 至 365 天。");
             HashSet<string> identifiers = new HashSet<string>(StringComparer.Ordinal);
