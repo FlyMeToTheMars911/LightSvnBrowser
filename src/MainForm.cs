@@ -1765,7 +1765,7 @@ namespace LightSvnBrowser
             currentRepository = repository;
             BuildNavigation(repository.Id);
             pageTitle.Text = "产品历史文档";
-            address.Text = repository.Url + "/设计文档";
+            address.Text = SvnService.BuildDisplayUrl(repository, "设计文档");
             indexStatus.Text = "搜索索引更新于 2026-11-02 10:30 · 文件名索引，不下载整库";
             DateTime modified = new DateTime(2026, 11, 2, 2, 30, 0, DateTimeKind.Utc);
             PopulateEntries(new[]

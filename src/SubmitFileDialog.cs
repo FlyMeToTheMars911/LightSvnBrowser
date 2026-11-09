@@ -68,7 +68,7 @@ namespace LightSvnBrowser
             DialogStyle.Apply(this, "提交新版本", new Size(760, 848));
             TableLayoutPanel fields = DialogStyle.CreateFields();
             DialogStyle.AddField(fields, "目标仓库", MakeLabel(repository.Name, 26));
-            _targetPath = ReadOnlyField(relativePath + Environment.NewLine + SvnService.BuildUrl(repository, relativePath), 0);
+            _targetPath = ReadOnlyField(relativePath + Environment.NewLine + SvnService.BuildDisplayUrl(repository, relativePath), 0);
             _targetPath.Multiline = true;
             _targetPath.Height = 60;
             _targetPath.ScrollBars = ScrollBars.Horizontal;

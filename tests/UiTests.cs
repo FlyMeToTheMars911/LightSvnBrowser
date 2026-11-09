@@ -89,7 +89,7 @@ namespace LightSvnBrowser
             Run("sidebar workspaces restore separate repository, search and favorite positions", IndependentWorkspaces);
             Run("search and favorite rows locate their exact repository items", LocateRepositoryItems);
             Run("each repository reopens its own directory and root is a separate history step", RepositoryDirectoryResume);
-            Run("directory, revision history and add dialog show Chinese paths while SVN receives encoded URLs", ReadableSvnAddress);
+            Run("directory and dialogs display Chinese SVN addresses while commands retain encoded URLs", ReadableSvnAddress);
             Run("data-directory shortcut keeps executable and quoted arguments", DataDirectoryShortcut);
             Run("history restores search rows, scope, selection, scroll and columns without SVN", HistorySearchRestore);
             Run("history records executed search rather than later unsubmitted input", HistoryExecutedQuery);
@@ -1212,8 +1212,9 @@ namespace LightSvnBrowser
             const string relativePath = "部署文档/增值模块%20#与@";
             AppStore store = NewStore("readable-svn-address");
             Repository repository = AddRepository(store, "readable-address", "Readable address", String.Empty);
-            repository.Url += "/" + Uri.EscapeDataString("仓库资料");
-            const string expected = "https://offline.invalid/readable-address/仓库资料/部署文档/增值模块%2520%23与%40";
+            repository.Url += "/" + Uri.EscapeDataString("仓库资料").ToLowerInvariant();
+            const string expectedRoot = "https://offline.invalid/readable-address/仓库资料";
+            const string expected = expectedRoot + "/部署文档/增值模块%2520%23与%40";
             string canonical = SvnService.BuildUrl(repository, relativePath);
             using (MainForm form = OpenMain(store))
             {
@@ -1232,6 +1233,28 @@ namespace LightSvnBrowser
                 TextBox target = ControlTree(dialog).OfType<TextBox>().Single(control => control.AccessibleName == "新增目标目录和地址");
                 Assert(target.ReadOnly && target.Text == repository.Name + "  /  " + relativePath + Environment.NewLine + expected,
                     "The add dialog did not show the readable target directory and address.");
+            }
+            using (SubmitFileDialog dialog = new SubmitFileDialog(store, new SvnService(store, Application.ExecutablePath), repository, relativePath, DefaultUiFontSize))
+            {
+                TextBox target = Field<TextBox>(dialog, "_targetPath");
+                Assert(target.ReadOnly && target.Text == relativePath + Environment.NewLine + expected,
+                    "The submit dialog did not show the readable target file and address.");
+            }
+            using (RepositoryDialog dialog = new RepositoryDialog(store, repository, Enumerable.Empty<string>()))
+            {
+                OpenOffscreen(dialog);
+                Assert(Field<TextBox>(dialog, "_url").Text == expectedRoot, "The repository editor did not show a readable address.");
+                Call(dialog, "SaveClicked", null, EventArgs.Empty);
+                Assert(dialog.Result != null && dialog.Result.Url == repository.Url, "Saving the displayed address changed the original URL spelling.");
+            }
+            using (RepositoryDialog dialog = new RepositoryDialog(store, repository, Enumerable.Empty<string>()))
+            {
+                OpenOffscreen(dialog);
+                Field<TextBox>(dialog, "_url").Text = expectedRoot + "/项目说明%25%23";
+                Call(dialog, "SaveClicked", null, EventArgs.Empty);
+                string encodedPath = Uri.EscapeDataString("仓库资料") + "/" + Uri.EscapeDataString("项目说明%#");
+                Assert(dialog.Result != null && dialog.Result.Url == "https://offline.invalid/readable-address/" + encodedPath,
+                    "Editing the readable address did not save an encoded URL.");
             }
             string[][] commands = Directory.GetFiles(store.DataDirectory, "fake-svn-call-*.txt").Select(File.ReadAllLines).ToArray();
             Assert(commands.Any(command => command[0] == "list" && command[1] == canonical + "@HEAD") &&
@@ -1355,7 +1378,8 @@ namespace LightSvnBrowser
                 WaitSubmissionIdle(dialog);
                 Assert(Field<SvnEntry>(dialog, "_latest") != null, "Confirmation did not obtain fresh server metadata.");
                 TextBox target = Field<TextBox>(dialog, "_targetPath");
-                Assert(target.ReadOnly && target.Text == relativePath + Environment.NewLine + SvnService.BuildUrl(repository, relativePath), "Target path is editable or does not show both the readable name and exact SVN URL.");
+                Assert(target.ReadOnly && target.Text == relativePath + Environment.NewLine + repository.Url + "/" + relativePath,
+                    "Target path is editable or does not show both the readable name and SVN URL.");
                 string localFile = Path.Combine(store.DataDirectory, "different-local-name.txt");
                 File.WriteAllText(localFile, "edited local content", new UTF8Encoding(false));
                 Call(dialog, "SetLocalFile", localFile);

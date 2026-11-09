@@ -21,6 +21,10 @@ public static class TestRunner
     private const string GbkErrorMode = "gbk-error";
     private const string SvnErrorDiagnostic = "svn: E170001: Authorization failed.";
     private const string ChineseErrorDiagnostic = "提交受限：部署文档/数据归档.zip";
+    private const string EncodedDiagnosticPath = "/%E9%83%A8%E7%BD%B2%E6%96%87%E6%A1%A3/%E6%95%B0%E6%8D%AE%E5%BD%92%E6%A1%A3%2520%23%40";
+    private const string ReadableDiagnosticPath = "/部署文档/数据归档%2520%23%40";
+    private const string LiteralPercentDiagnostic = "提交受限：部署文档/字面%E4%B8%AD.txt";
+    private static readonly string[] DiagnosticUrlRoots = { "https://example.invalid", "http://example.invalid", "svn://example.invalid", "file:///C:" };
     private static int _assertions;
     private static string _testRoot;
     private static string _svn;
@@ -772,6 +776,10 @@ public static class TestRunner
                 Assert(ex.Message.Contains(SvnErrorDiagnostic) && ex.Message.Contains(ChineseErrorDiagnostic), mode + " preserves the SVN error code and Chinese diagnostic");
                 Assert(ex.ServerError.Contains(ChineseErrorDiagnostic) && !ex.Message.Contains(password)
                     && !ex.ServerError.Contains(password) && ex.ServerError.Contains("[已隐藏]"), mode + " redacts the password after decoding stderr");
+                Assert(DiagnosticUrlRoots.All(rootUrl => ex.Message.Contains(rootUrl + ReadableDiagnosticPath)
+                    && !ex.Message.Contains(rootUrl + EncodedDiagnosticPath) && ex.ServerError.Contains(rootUrl + EncodedDiagnosticPath)),
+                    mode + " displays Chinese in diagnostic URLs while preserving raw URLs and reserved escapes");
+                Assert(ex.Message.Contains(LiteralPercentDiagnostic), mode + " preserves literal percent escapes in non-URL hook output");
             }
             Assert(CountAttempts(root) == before + 1, mode + " invokes exactly once without retries");
         }
@@ -1099,7 +1107,9 @@ public static class TestRunner
             const int gbkCodePage = 936;
             const int errorExitCode = 7;
             Encoding encoding = mode == Utf8ErrorMode ? Encoding.UTF8 : Encoding.GetEncoding(gbkCodePage);
-            byte[] bytes = encoding.GetBytes(SvnErrorDiagnostic + "\r\n" + ChineseErrorDiagnostic + "\r\n" + password + "\r\n");
+            string urls = String.Join("\r\n", DiagnosticUrlRoots.Select(rootUrl => "'" + rootUrl + EncodedDiagnosticPath + "'"));
+            byte[] bytes = encoding.GetBytes(SvnErrorDiagnostic + "\r\n" + ChineseErrorDiagnostic + "\r\n"
+                + LiteralPercentDiagnostic + "\r\n" + urls + "\r\n" + password + "\r\n");
             using (Stream stderr = Console.OpenStandardError()) stderr.Write(bytes, 0, bytes.Length);
             return errorExitCode;
         }

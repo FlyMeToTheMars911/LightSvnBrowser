@@ -183,7 +183,7 @@ namespace LightSvnBrowser
                 }
             }
             _group.Text = existing == null ? string.Empty : existing.Group ?? string.Empty;
-            _url = DialogStyle.TextField(existing == null ? string.Empty : existing.Url, 2);
+            _url = DialogStyle.TextField(existing == null ? string.Empty : SvnService.FormatDisplayUrl(existing.Url), 2);
             _allowIpCertificateNameMismatch = new CheckBox();
             _allowIpCertificateNameMismatch.Text = "允许 IP 地址与证书域名不一致（仅此仓库）";
             _allowIpCertificateNameMismatch.AutoSize = true;
@@ -247,6 +247,8 @@ namespace LightSvnBrowser
                 DialogStyle.Error(this, error, _url);
                 return;
             }
+            if (_original != null && String.Equals(_url.Text.Trim(), SvnService.FormatDisplayUrl(_original.Url).Trim(), StringComparison.Ordinal))
+                normalizedUrl = _original.Url;
             try
             {
                 string protectedPassword = _passwordUnavailable && string.IsNullOrEmpty(_password.Text)

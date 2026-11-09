@@ -450,6 +450,8 @@ namespace LightSvnBrowser
         private static readonly Encoding SvnErrorGb18030 = Encoding.GetEncoding(Gb18030CodePage,
             EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
         private static readonly Regex EscapedNonAsciiBytes = new Regex(@"(?:%[89A-Fa-f][0-9A-Fa-f])+");
+        private static readonly Regex SvnDiagnosticUrls = new Regex(@"\b(?:https?|svn|file)://[^\s<>""']+",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> IndexUpdateLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
         private readonly AppStore _store;
         private readonly string _executable;
@@ -501,7 +503,15 @@ namespace LightSvnBrowser
         /// <returns>The display address with percent-encoded UTF-8 decoded.</returns>
         internal static string BuildDisplayUrl(Repository repository, string path)
         {
-            return EscapedNonAsciiBytes.Replace(BuildUrl(repository, path), match => Uri.UnescapeDataString(match.Value));
+            return FormatDisplayUrl(BuildUrl(repository, path));
+        }
+
+        /// <summary>Formats an SVN address without changing its ASCII escapes or separators.</summary>
+        /// <param name="url">The address to show to the user.</param>
+        /// <returns>The address with percent-encoded Unicode displayed as text.</returns>
+        internal static string FormatDisplayUrl(string url)
+        {
+            return EscapedNonAsciiBytes.Replace(url ?? String.Empty, match => Uri.UnescapeDataString(match.Value));
         }
 
         private static string NormalizePath(string path)
@@ -792,7 +802,9 @@ namespace LightSvnBrowser
                             if (password.Length > 0) error = error.Replace(password, "[已隐藏]");
                             if (!repository.AllowIpCertificateNameMismatch && error.IndexOf(CertificateNameErrorText, StringComparison.OrdinalIgnoreCase) >= 0)
                                 error += "\r\n若此仓库必须通过 IP 访问，可在“编辑仓库”中勾选“允许 IP 地址与证书域名不一致（仅此仓库）”。";
-                            throw new SvnCommandException("SVN 请求失败（" + process.ExitCode.ToString(CultureInfo.InvariantCulture) + "），未自动重试。\r\n" + error.Trim(), error);
+                            string displayError = SvnDiagnosticUrls.Replace(error.Trim(), match => FormatDisplayUrl(match.Value));
+                            if (!String.IsNullOrEmpty(password)) displayError = displayError.Replace(password, "[已隐藏]");
+                            throw new SvnCommandException("SVN 请求失败（" + process.ExitCode.ToString(CultureInfo.InvariantCulture) + "），未自动重试。\r\n" + displayError, error);
                         }
                     }
                     _store.Log("svn_complete", "operation=" + operation + " repository=" + repository.Id);
