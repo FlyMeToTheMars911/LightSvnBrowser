@@ -154,7 +154,17 @@ namespace LightSvnBrowser
         public SubmissionAttempt GetPendingSubmission(Repository repository, string path)
         {
             string targetUrl = BuildUrl(repository, path);
-            string file = PendingPath(targetUrl);
+            return ReadPendingSubmission(targetUrl, targetUrl, path);
+        }
+
+        /// <summary>Reads and validates the pending record for an exact submission target.</summary>
+        /// <param name="pendingKey">Key identifying the submission type and target.</param>
+        /// <param name="targetUrl">Expected canonical target URL.</param>
+        /// <param name="path">Expected repository-relative path.</param>
+        /// <returns>The pending attempt, or null.</returns>
+        private SubmissionAttempt ReadPendingSubmission(string pendingKey, string targetUrl, string path)
+        {
+            string file = PendingPath(pendingKey);
             if (!File.Exists(file)) return null;
             SubmissionAttempt attempt = ReadSubmissionJson<SubmissionAttempt>(file, SourceFileLimit);
             Guid identity;
@@ -297,20 +307,13 @@ namespace LightSvnBrowser
                 if (pending == null || !String.Equals(pending.Id, attempt.Id, StringComparison.Ordinal))
                     throw new InvalidOperationException("待核实记录已变化，请重新打开提交窗口。");
                 _store.Log("submission_verify_start", "repository=" + repository.Id + " path=" + attempt.Path + " attempt=" + attempt.Id);
-                byte[] bytes = await RunSubmissionCommandAsync(repository, new List<string> { "log", "--xml", "--revision", HeadRevision + ":" + pending.SnapshotRevision,
-                    "--search", "*LightSvnBrowser:" + pending.Id + "*",
-                    "--", targetUrl + "@HEAD" }, cancellationToken).ConfigureAwait(false);
-                XElement found = ParseXml(bytes).Descendants("logentry").FirstOrDefault(logEntry =>
-                    ((string)logEntry.Element("msg") ?? String.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                    .Any(line => String.Equals(line, SubmissionMarker(pending), StringComparison.Ordinal)));
-                if (found == null)
+                string revision = await FindSubmissionRevisionAsync(repository, pending, cancellationToken).ConfigureAwait(false);
+                if (revision == null)
                 {
                     _store.Log("submission_verify_unresolved", "repository=" + repository.Id + " path=" + attempt.Path + " attempt=" + attempt.Id);
                     return new SubmissionResult { Status = SubmissionStatus.Unknown, Attempt = pending,
                         Message = "暂未在可读取的提交记录中找到本次提交，仍不能确认它未提交。请稍后再次核实，或联系仓库管理员核对；不会重复提交。" };
                 }
-                string revision = (string)found.Attribute("revision");
-                ValidateRevision(revision);
                 SvnEntry entry = null;
                 string workingFile = System.IO.Path.Combine(SubmissionRoot(), pending.Id, WorkingDirectoryName, System.IO.Path.GetFileName(pending.Path));
                 try
@@ -325,6 +328,25 @@ namespace LightSvnBrowser
                 return new SubmissionResult { Status = SubmissionStatus.Committed, Entry = entry, Revision = revision, Message = "已核实提交成功，版本 r" + revision + "。" };
             }
             finally { gate.Release(); }
+        }
+
+        /// <summary>Reads the commit revision associated with a pending attempt's exact log marker.</summary>
+        /// <param name="repository">Selected repository.</param>
+        /// <param name="pending">Validated pending record.</param>
+        /// <param name="cancellationToken">Cancels the history lookup.</param>
+        /// <returns>The matching revision, or null when the marker is absent.</returns>
+        private async Task<string> FindSubmissionRevisionAsync(Repository repository, SubmissionAttempt pending, CancellationToken cancellationToken)
+        {
+            byte[] bytes = await RunSubmissionCommandAsync(repository, new List<string> { "log", "--xml", "--revision", HeadRevision + ":" + pending.SnapshotRevision,
+                "--search", "*LightSvnBrowser:" + pending.Id + "*",
+                "--", pending.TargetUrl + "@" + HeadRevision }, cancellationToken).ConfigureAwait(false);
+            XElement found = ParseXml(bytes).Descendants("logentry").FirstOrDefault(logEntry =>
+                ((string)logEntry.Element("msg") ?? String.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .Any(line => String.Equals(line, SubmissionMarker(pending), StringComparison.Ordinal)));
+            if (found == null) return null;
+            string revision = (string)found.Attribute("revision");
+            ValidateRevision(revision);
+            return revision;
         }
 
         /// <summary>Reads an authoritative remote file at one repository snapshot.</summary>
@@ -510,8 +532,9 @@ namespace LightSvnBrowser
         /// <summary>Persists one JSON file atomically before a commit can start.</summary>
         /// <param name="path">Program-owned record path.</param>
         /// <param name="value">Serializable metadata.</param>
+        /// <param name="replaceExisting">Whether a record already at the destination may be replaced.</param>
         /// <returns>No value.</returns>
-        private static void WriteSubmissionJson<T>(string path, T value)
+        private static void WriteSubmissionJson<T>(string path, T value, bool replaceExisting = true)
         {
             string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
@@ -521,7 +544,7 @@ namespace LightSvnBrowser
                     new DataContractJsonSerializer(typeof(T)).WriteObject(stream, value);
                     stream.Flush(true);
                 }
-                if (File.Exists(path)) File.Replace(temporary, path, null);
+                if (replaceExisting && File.Exists(path)) File.Replace(temporary, path, null);
                 else File.Move(temporary, path);
             }
             finally { AppStore.TryDeleteFile(temporary); }

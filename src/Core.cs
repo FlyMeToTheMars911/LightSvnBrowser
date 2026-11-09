@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -9,6 +10,7 @@ using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
@@ -262,6 +264,60 @@ namespace LightSvnBrowser
             Log("index_saved", "repository=" + snapshot.RepositoryId + " entries=" + snapshot.Entries.Count.ToString(CultureInfo.InvariantCulture));
         }
 
+        internal bool MergeAddedIndexEntries(string repositoryId, long revision, string directory, List<SvnEntry> roots, List<SvnEntry> additions)
+        {
+            lock (_indexReadGate)
+            {
+                IndexSnapshot snapshot = LoadIndex(repositoryId);
+                if (snapshot == null) return false;
+                if (ReadIndexRevision(snapshot.Revision) >= revision) return true;
+
+                HashSet<string> newerPaths = new HashSet<string>(snapshot.Entries
+                    .Where(entry => entry != null && ReadIndexRevision(entry.Revision) > revision)
+                    .Select(entry => entry.Path), StringComparer.Ordinal);
+                HashSet<string> affectedRoots = new HashSet<string>(roots
+                    .Where(entry => !HasIndexedAncestor(entry.Path, newerPaths))
+                    .Select(entry => entry.Path), StringComparer.Ordinal);
+                if (affectedRoots.Count == 0) return true;
+
+                string prefix = directory.Length == 0 ? String.Empty : directory + "/";
+                List<SvnEntry> merged = snapshot.Entries.Where(entry => entry == null || newerPaths.Contains(entry.Path) ||
+                    !IsUnderAddedRoot(entry.Path, prefix, affectedRoots)).ToList();
+                merged.AddRange(additions.Where(entry => !HasIndexedAncestor(entry.Path, newerPaths) &&
+                    IsUnderAddedRoot(entry.Path, prefix, affectedRoots)));
+                SaveIndex(new IndexSnapshot
+                {
+                    RepositoryId = repositoryId, Revision = snapshot.Revision, UpdatedUtc = DateTime.UtcNow, Entries = merged
+                });
+                Log("index_additions_merged", "repository=" + repositoryId + " revision=" + revision + " roots=" + affectedRoots.Count);
+                return true;
+            }
+        }
+
+        private static long ReadIndexRevision(string revision)
+        {
+            long number;
+            return Int64.TryParse(revision, NumberStyles.None, CultureInfo.InvariantCulture, out number) ? number : 0L;
+        }
+
+        private static bool HasIndexedAncestor(string path, HashSet<string> paths)
+        {
+            while (!paths.Contains(path))
+            {
+                int separator = path.LastIndexOf('/');
+                if (separator < 0) return false;
+                path = path.Substring(0, separator);
+            }
+            return true;
+        }
+
+        private static bool IsUnderAddedRoot(string path, string prefix, HashSet<string> roots)
+        {
+            if (String.IsNullOrEmpty(path) || !path.StartsWith(prefix, StringComparison.Ordinal)) return false;
+            int separator = path.IndexOf('/', prefix.Length);
+            return roots.Contains(separator < 0 ? path : path.Substring(0, separator));
+        }
+
         public void DeleteIndex(string repoId)
         {
             lock (_indexReadGate)
@@ -388,6 +444,13 @@ namespace LightSvnBrowser
         private const int ListTimeoutMilliseconds = 120000;
         private const int PreviewTimeoutMilliseconds = 180000;
         private const int DownloadTimeoutMilliseconds = 600000;
+        private const int MaxSvnErrorCharacters = 65536;
+        private const int Gb18030CodePage = 54936;
+        private static readonly Encoding SvnErrorUtf8 = new UTF8Encoding(true, true);
+        private static readonly Encoding SvnErrorGb18030 = Encoding.GetEncoding(Gb18030CodePage,
+            EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
+        private static readonly Regex EscapedNonAsciiBytes = new Regex(@"(?:%[89A-Fa-f][0-9A-Fa-f])+");
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> IndexUpdateLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
         private readonly AppStore _store;
         private readonly string _executable;
         private readonly object _cacheGate = new object();
@@ -430,6 +493,15 @@ namespace LightSvnBrowser
             string relative = NormalizePath(path);
             string root = uri.AbsoluteUri.TrimEnd('/');
             return relative.Length == 0 ? root : root + "/" + String.Join("/", relative.Split('/').Select(Uri.EscapeDataString));
+        }
+
+        /// <summary>Shows Unicode path names while preserving escaped ASCII characters in the address.</summary>
+        /// <param name="repository">The configured SVN repository.</param>
+        /// <param name="path">The repository-relative path.</param>
+        /// <returns>The display address with percent-encoded UTF-8 decoded.</returns>
+        internal static string BuildDisplayUrl(Repository repository, string path)
+        {
+            return EscapedNonAsciiBytes.Replace(BuildUrl(repository, path), match => Uri.UnescapeDataString(match.Value));
         }
 
         private static string NormalizePath(string path)
@@ -494,6 +566,19 @@ namespace LightSvnBrowser
         }
 
         public async Task<IndexSnapshot> BuildIndexAsync(Repository repository, CancellationToken cancellationToken)
+        {
+            SemaphoreSlim gate = GetIndexUpdateLock(repository.Id);
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try { return await BuildIndexSnapshotAsync(repository, cancellationToken).ConfigureAwait(false); }
+            finally { gate.Release(); }
+        }
+
+        private SemaphoreSlim GetIndexUpdateLock(string repositoryId)
+        {
+            return IndexUpdateLocks.GetOrAdd(_store.IndexDirectory + "\n" + AppStore.Hash(repositoryId), key => new SemaphoreSlim(1, 1));
+        }
+
+        private async Task<IndexSnapshot> BuildIndexSnapshotAsync(Repository repository, CancellationToken cancellationToken)
         {
             _store.Log("index_start", "repository=" + repository.Id);
             string revision;
@@ -660,7 +745,7 @@ namespace LightSvnBrowser
             {
                 FileName = _executable, Arguments = String.Join(" ", allArguments.Select(QuoteArgument)), UseShellExecute = false,
                 CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, RedirectStandardInput = true,
-                RedirectStandardOutput = true, RedirectStandardError = true, StandardErrorEncoding = Encoding.UTF8,
+                RedirectStandardOutput = true, RedirectStandardError = true,
                 WorkingDirectory = _store.DataDirectory
             };
             string temporaryDirectory = System.IO.Path.Combine(_store.DataDirectory, "temp");
@@ -677,7 +762,7 @@ namespace LightSvnBrowser
                     if (!process.Start()) throw new IOException("无法启动 SVN 命令行工具。");
                     using (timeoutSource.Token.Register(delegate { KillProcess(process); }))
                     {
-                        Task<string> errorTask = ReadErrorAsync(process.StandardError);
+                        Task<string> errorTask = ReadErrorAsync(process.StandardError.BaseStream);
                         Task outputTask = CopyOutputAsync(process.StandardOutput.BaseStream, destination, maxBytes, timeoutSource.Token);
                         Task monitorOutput = outputTask.ContinueWith(delegate(Task task) { if (task.IsFaulted || task.IsCanceled) KillProcess(process); }, TaskScheduler.Default);
                         Task waitTask = Task.Run(delegate { process.WaitForExit(); });
@@ -736,15 +821,36 @@ namespace LightSvnBrowser
             }
         }
 
-        private static async Task<string> ReadErrorAsync(StreamReader reader)
+        private static async Task<string> ReadErrorAsync(Stream source)
         {
-            const int maxCharacters = 65536;
-            StringBuilder result = new StringBuilder();
-            char[] buffer = new char[4096];
-            int count;
-            while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
-                if (result.Length < maxCharacters) result.Append(buffer, 0, Math.Min(count, maxCharacters - result.Length));
-            return result.ToString();
+            const int maxBytes = (MaxSvnErrorCharacters + 1) * 4;
+            byte[] buffer = new byte[4096];
+            using (MemoryStream captured = new MemoryStream())
+            {
+                int count;
+                while ((count = await source.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+                {
+                    int remaining = maxBytes - (int)captured.Length;
+                    if (remaining > 0) captured.Write(buffer, 0, Math.Min(count, remaining));
+                }
+                if (captured.Length == 0) return String.Empty;
+
+                try { return DecodeError(captured, SvnErrorUtf8); }
+                catch (DecoderFallbackException) { }
+                try { return DecodeError(captured, SvnErrorGb18030); }
+                catch (DecoderFallbackException) { return DecodeError(captured, Encoding.Default); }
+            }
+        }
+
+        private static string DecodeError(MemoryStream captured, Encoding encoding)
+        {
+            captured.Position = 0;
+            using (StreamReader reader = new StreamReader(captured, encoding, true, 4096, true))
+            {
+                char[] text = new char[Math.Min((int)captured.Length, MaxSvnErrorCharacters)];
+                int length = reader.ReadBlock(text, 0, text.Length);
+                return new string(text, 0, length);
+            }
         }
 
         private static void KillProcess(Process process)

@@ -35,7 +35,7 @@ namespace LightSvnBrowser
         [STAThread]
         public static int Main(string[] args)
         {
-            if (args.Length > 0 && new[] { "list", "info", "cat" }.Contains(args[0])) return FakeSvn(args);
+            if (args.Length > 0 && new[] { "list", "info", "cat", "log" }.Contains(args[0])) return FakeSvn(args);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Control.CheckForIllegalCrossThreadCalls = true;
@@ -86,6 +86,10 @@ namespace LightSvnBrowser
             Run("history restores sorted arrows selection and originally unsorted snapshots", SortingHistory);
             Run("cancelled navigation cannot overwrite newer directory", NavigationRace);
             Run("switching to favorites cancels pending navigation", NavigationToFavorites);
+            Run("sidebar workspaces restore separate repository, search and favorite positions", IndependentWorkspaces);
+            Run("search and favorite rows locate their exact repository items", LocateRepositoryItems);
+            Run("each repository reopens its own directory and root is a separate history step", RepositoryDirectoryResume);
+            Run("directory, revision history and add dialog show Chinese paths while SVN receives encoded URLs", ReadableSvnAddress);
             Run("data-directory shortcut keeps executable and quoted arguments", DataDirectoryShortcut);
             Run("history restores search rows, scope, selection, scroll and columns without SVN", HistorySearchRestore);
             Run("history records executed search rather than later unsubmitted input", HistoryExecutedQuery);
@@ -537,7 +541,7 @@ namespace LightSvnBrowser
             using (MainForm form = OpenMain(store))
             {
                 TreeView tree = Field<TreeView>(form, "navigation");
-                TreeNode root = tree.Nodes[1];
+                TreeNode root = tree.Nodes["repositories"];
                 TreeNode team = root.Nodes.Cast<TreeNode>().Single(n => n.Text == "团队");
                 TreeNode product = team.Nodes.Cast<TreeNode>().Single(n => n.Text == "产品");
                 Assert(product.Nodes.Cast<TreeNode>().Any(n => n.Text == "归档"), "Nested group node was not created.");
@@ -631,8 +635,10 @@ namespace LightSvnBrowser
             });
             using (MainForm form = OpenMain(store))
             {
-                SetField(form, "currentRepository", repository);
-                SetField(form, "currentPath", "设计");
+                TreeView tree = Field<TreeView>(form, "navigation");
+                tree.SelectedNode = tree.Nodes["search"];
+                Pump((Task)Call(form, "NavigateAsync", repository, "设计"));
+                tree.SelectedNode = tree.Nodes["search"];
                 Field<ComboBox>(form, "scope").SelectedIndex = 2;
                 Field<TextBox>(form, "search").Text = "接口 说明";
                 Pump((Task)Call(form, "SearchAsync"));
@@ -935,18 +941,316 @@ namespace LightSvnBrowser
             using (MainForm form = OpenMain(store))
             {
                 Task slow = (Task)Call(form, "NavigateAsync", repository, "slow");
-                Call(form, "ShowFavorites", new object[] { null });
+                TreeView tree = Field<TreeView>(form, "navigation");
+                tree.SelectedNode = tree.Nodes["favorites"];
                 Pump(slow);
                 Assert(Field<bool>(form, "showingFavorites") && Field<Label>(form, "pageTitle").Text == "我的收藏", "Cancelled navigation replaced the favorites view.");
                 Assert(Field<ListView>(form, "files").Items.Count == 1, "Favorites rows were lost.");
             }
         }
 
+        /// <summary>Switches through the visible sidebar and checks that all three lists restore their own context.</summary>
+        /// <returns>None.</returns>
+        private static void IndependentWorkspaces()
+        {
+            AppStore store = NewStore("independent-workspaces");
+            Repository repository = PrepareHistorySearch(store);
+            Favorite saved = AddFavorite(store, repository);
+            store.Config.Favorites.Add(new Favorite { Id = "unrelated", RepositoryId = repository.Id, Path = "other.txt", Name = "Other" });
+            using (MainForm form = OpenMain(store))
+            {
+                const int directorySortColumn = 3;
+                const int nameColumn = 0;
+                const int allRepositoriesScope = 1;
+                const string favoriteQuery = "核对";
+                const string searchQuery = "Target folder";
+                ListView list = Field<ListView>(form, "files");
+                TreeView tree = Field<TreeView>(form, "navigation");
+                TextBox query = Field<TextBox>(form, "search");
+                ComboBox scopeBox = Field<ComboBox>(form, "scope");
+                TextBox addressBox = Field<TextBox>(form, "address");
+                Button addItems = Field<Button>(form, "addItems");
+                Button directoryHistory = Field<Button>(form, "directoryHistory");
+                ToolStripMenuItem selectionHistory = Field<ToolStripMenuItem>(form, "selectionHistoryMenuItem");
+                Assert(!addItems.Enabled && !directoryHistory.Enabled && !selectionHistory.Enabled,
+                    "SVN operations were enabled on the repository overview.");
+
+                Pump((Task)Call(form, "NavigateAsync", repository, "sort-fixture"));
+                Call(form, "SortByColumn", directorySortColumn);
+                SelectSortRow(form, list.Items.Cast<ListViewItem>().Single(row => row.Text == SortFolderName));
+                Call(form, "UpdateActions");
+                Assert(addItems.Enabled && directoryHistory.Enabled && selectionHistory.Enabled,
+                    "The current directory or its selected folder did not expose SVN operations.");
+                list.Columns[nameColumn].Width = 247;
+                string directoryAddress = addressBox.Text;
+                string[] directoryRows = VisibleRows(list);
+                string[] directoryTitles = ColumnTitles(list);
+
+                scopeBox.SelectedIndex = allRepositoriesScope;
+                query.Text = searchQuery;
+                Pump((Task)Call(form, "SearchAsync"));
+                Assert(tree.SelectedNode == tree.Nodes["search"] && list.Items.Count == 100,
+                    "Searching did not activate the Search workspace.");
+                Assert(!addItems.Enabled && !directoryHistory.Enabled, "Search exposed current-directory actions.");
+                Call(form, "SortByColumn", nameColumn);
+                Call(form, "SortByColumn", nameColumn);
+                SelectSortRow(form, list.Items[65]);
+                list.TopItem = list.Items[50];
+                list.Columns[nameColumn].Width = 271;
+                int searchTop = list.TopItem.Index;
+                string selectedSearch = list.SelectedItems[0].Text;
+                string[] searchRows = VisibleRows(list);
+                int calls = FakeCalls(store);
+
+                tree.SelectedNode = tree.Nodes["favorites"];
+                query.Text = favoriteQuery;
+                Pump((Task)Call(form, "SearchAsync"));
+                Assert(list.Items.Count == 1 && list.Items[0].Text == saved.Name, "The Favorites filter did not narrow the list.");
+                SelectSortRow(form, list.Items[0]);
+                list.Columns[nameColumn].Width = 225;
+                Assert(!addItems.Enabled && !directoryHistory.Enabled, "Favorites exposed current-directory actions.");
+
+                tree.SelectedNode = tree.Nodes["repositories"];
+                Assert(addressBox.Text == directoryAddress && VisibleRows(list).SequenceEqual(directoryRows),
+                    "Returning to Repositories lost the last browsed directory.");
+                Assert(list.SelectedItems.Count == 1 && list.SelectedItems[0].Text == SortFolderName && list.Columns[nameColumn].Width == 247,
+                    "Returning to Repositories lost its selected row or column width.");
+                Assert(ColumnTitles(list).SequenceEqual(directoryTitles),
+                    "Sorting Search changed the remembered directory sort.");
+
+                tree.SelectedNode = tree.Nodes["search"];
+                Assert(query.Text == searchQuery && scopeBox.SelectedIndex == allRepositoriesScope && VisibleRows(list).SequenceEqual(searchRows),
+                    "Returning to Search lost its query, scope or results.");
+                Assert(list.SelectedItems.Count == 1 && list.SelectedItems[0].Text == selectedSearch && list.TopItem.Index == searchTop && list.Columns[nameColumn].Width == 271,
+                    "Returning to Search lost its selection, scroll position or column width.");
+
+                tree.SelectedNode = tree.Nodes["favorites"];
+                Assert(query.Text == favoriteQuery && list.Items.Count == 1 && list.SelectedItems.Count == 1 && list.SelectedItems[0].Text == saved.Name,
+                    "Returning to Favorites lost its filter or selected row.");
+                Assert(list.Columns[nameColumn].Width == 225 && FakeCalls(store) == calls,
+                    "Returning to a remembered workspace changed its column width or contacted SVN.");
+
+                tree.SelectedNode = tree.Nodes["repositories"];
+                Pump((Task)Call(form, "RefreshViewAsync"));
+                Assert(ColumnTitles(list).SequenceEqual(directoryTitles) && VisibleRows(list).SequenceEqual(directoryRows),
+                    "Refreshing the directory inherited Search's ordering.");
+            }
+        }
+
+        /// <summary>Reveals a search folder and an aliased favorite file using their paths and owning repositories.</summary>
+        /// <returns>None.</returns>
+        private static void LocateRepositoryItems()
+        {
+            const string directory = "sort-fixture";
+            const int allRepositoriesScope = 1;
+            AppStore store = NewStore("locate-repository-items");
+            Repository first = AddRepository(store, "locate-first", "First repository", "Examples");
+            Repository second = AddRepository(store, "locate-second", "Second repository", "Examples");
+            List<SvnEntry> entries = SortEntries();
+            foreach (SvnEntry entry in entries) entry.Path = directory + "/" + entry.Name;
+            foreach (Repository repository in store.Config.Repositories)
+                store.SaveIndex(new IndexSnapshot { RepositoryId = repository.Id, Revision = "7", UpdatedUtc = DateTime.UtcNow, Entries = entries });
+            Favorite saved = new Favorite { Id = "aliased-locate", RepositoryId = first.Id, Path = directory + "/" + SortSmallName, Name = "别名文件" };
+            store.Config.Favorites.Add(saved);
+            using (MainForm form = OpenMain(store))
+            {
+                ListView list = Field<ListView>(form, "files");
+                TreeView tree = Field<TreeView>(form, "navigation");
+                TextBox addressBox = Field<TextBox>(form, "address");
+                ToolStripMenuItem locate = Field<ToolStripMenuItem>(form, "locateMenuItem");
+                ToolStripMenuItem history = Field<ToolStripMenuItem>(form, "selectionHistoryMenuItem");
+                Field<ComboBox>(form, "scope").SelectedIndex = allRepositoriesScope;
+                Field<TextBox>(form, "search").Text = SortFolderName;
+                Pump((Task)Call(form, "SearchAsync"));
+                Assert(list.Items.Count == 2 && !locate.Enabled, "Search fixture has no duplicate or locate is enabled without selection.");
+                Assert(locate.Text == "跳转到仓库中的位置" && list.ContextMenuStrip.Items.Contains(locate), "Locate is missing from the row context menu.");
+                ListViewItem target = list.Items.Cast<ListViewItem>().Single(row => row.SubItems[4].Text.StartsWith(second.Name + "/", StringComparison.Ordinal));
+                Point point = new Point(target.Bounds.Left + 10, target.Bounds.Top + target.Bounds.Height / 2);
+                string searchAddress = addressBox.Text;
+                int calls = FakeCalls(store);
+                Call(list, "OnMouseMove", new MouseEventArgs(MouseButtons.None, 0, point.X, point.Y, 0));
+                Call(list, "OnMouseDown", new MouseEventArgs(MouseButtons.Right, 1, point.X, point.Y, 0));
+                Application.DoEvents();
+                Assert(tree.SelectedNode == tree.Nodes["search"] && addressBox.Text == searchAddress && FakeCalls(store) == calls,
+                    "Hovering or right-clicking the row opened the directory before the menu command was clicked.");
+                Assert(list.SelectedItems.Count == 1 && list.SelectedItems[0] == target && locate.Enabled && history.Enabled,
+                    "Right-clicking did not select the search folder and enable locate and history.");
+                ClickLocate(form, locate);
+                Assert(addressBox.Text == SvnService.BuildUrl(second, directory) && list.SelectedItems.Count == 1 && list.SelectedItems[0].Text == SortFolderName,
+                    "Search locate did not select the folder in its own repository's parent directory.");
+                Assert(!locate.Enabled && FakeCalls(store) == calls + 1, "Locating made extra SVN calls or remained available in the directory.");
+
+                tree.SelectedNode = tree.Nodes["favorites"];
+                Assert(list.Items.Count == 1 && list.Items[0].Text == saved.Name, "The fixture did not show its alias.");
+                SelectSortRow(form, list.Items[0]);
+                Call(form, "UpdateActions");
+                Assert(locate.Enabled && history.Enabled, "The selected favorite file does not expose locate and history.");
+                calls = FakeCalls(store);
+                ClickLocate(form, locate);
+                Pump(Task.Delay(350));
+                Assert(addressBox.Text == SvnService.BuildUrl(first, directory) && list.SelectedItems.Count == 1 && list.SelectedItems[0].Text == SortSmallName,
+                    "Favorite locate used the display alias or an unrelated repository.");
+                Assert(FakeCalls(store) == calls + 1, "Favorite locate started a preview or made another SVN call.");
+
+                tree.SelectedNode = tree.Nodes["search"];
+                Assert(list.Items.Count == 2 && list.SelectedItems.Count == 1 && list.SelectedItems[0].SubItems[4].Text.StartsWith(second.Name + "/", StringComparison.Ordinal),
+                    "Locating from Search changed the remembered results or selection.");
+                tree.SelectedNode = tree.Nodes["favorites"];
+                Assert(list.Items.Count == 1 && list.SelectedItems.Count == 1 && list.SelectedItems[0].Text == saved.Name,
+                    "Locating from Favorites changed the remembered alias or selection.");
+            }
+        }
+
+        /// <summary>Clicks the actual menu item and pumps the resulting asynchronous navigation.</summary>
+        /// <param name="form">The main window being tested.</param>
+        /// <param name="locate">The locate command in the row context menu.</param>
+        /// <returns>None.</returns>
+        private static void ClickLocate(MainForm form, ToolStripMenuItem locate)
+        {
+            locate.PerformClick();
+            WaitForDirectoryNavigation(form);
+        }
+
+        /// <summary>Pumps the UI until the current repository navigation finishes.</summary>
+        /// <param name="form">The main window waiting for a directory.</param>
+        /// <returns>None.</returns>
+        private static void WaitForDirectoryNavigation(MainForm form)
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(12);
+            while (Field<CancellationTokenSource>(form, "operation") != null && DateTime.UtcNow < deadline)
+            {
+                Application.DoEvents();
+                Thread.Sleep(10);
+            }
+            Assert(Field<CancellationTokenSource>(form, "operation") == null, "Directory navigation did not complete.");
+            Application.DoEvents();
+        }
+
+        /// <summary>Checks both repository entry points, the explicit root action, and restart behavior.</summary>
+        /// <returns>None.</returns>
+        private static void RepositoryDirectoryResume()
+        {
+            const string firstDirectory = "产品资料/设计";
+            const string secondDirectory = "发布资料/手册";
+            AppStore store = NewStore("repository-directory-resume");
+            Repository first = AddRepository(store, "first-resume", "First repository", String.Empty);
+            Repository second = AddRepository(store, "second-resume", "Second repository", String.Empty);
+            store.Save();
+            using (MainForm form = OpenMain(store))
+            {
+                TreeView tree = Field<TreeView>(form, "navigation");
+                TreeNode repositories = tree.Nodes["repositories"];
+                TreeNode firstNode = repositories.Nodes.Cast<TreeNode>().Single(node => node.Text == first.Name);
+                TreeNode secondNode = repositories.Nodes.Cast<TreeNode>().Single(node => node.Text == second.Name);
+                Button root = Field<Button>(form, "goToRoot");
+                Button back = Field<Button>(form, "back");
+                Button forward = Field<Button>(form, "forward");
+                Assert(root.Text == "回到根目录" && root.Parent == back.Parent && root.Right <= back.Left,
+                    "The root button is not to the left of Back.");
+                Assert(!root.Enabled, "Root navigation was enabled on the repository overview.");
+
+                Pump((Task)Call(form, "NavigateAsync", first, firstDirectory));
+                using (TestMessageBoxCloser closer = new TestMessageBoxCloser())
+                    Pump((Task)Call(form, "NavigateAsync", first, "failed"));
+                tree.SelectedNode = secondNode;
+                WaitForDirectoryNavigation(form);
+                AssertDirectory(form, second, String.Empty);
+                Pump((Task)Call(form, "NavigateAsync", second, secondDirectory));
+
+                tree.SelectedNode = firstNode;
+                WaitForDirectoryNavigation(form);
+                AssertDirectory(form, first, firstDirectory);
+                Assert(root.Enabled, "The nested directory did not enable the root button.");
+                root.PerformClick();
+                WaitForDirectoryNavigation(form);
+                AssertDirectory(form, first, String.Empty);
+
+                back.PerformClick();
+                AssertDirectory(form, first, firstDirectory);
+                forward.PerformClick();
+                AssertDirectory(form, first, String.Empty);
+                back.PerformClick();
+                AssertDirectory(form, first, firstDirectory);
+
+                tree.SelectedNode = repositories;
+                ListView rows = Field<ListView>(form, "files");
+                SelectSortRow(form, rows.Items.Cast<ListViewItem>().Single(row => row.Text == second.Name));
+                Pump((Task)Call(form, "ActivateSelectionAsync"));
+                AssertDirectory(form, second, secondDirectory);
+            }
+
+            using (MainForm reopened = OpenMain(new AppStore(store.DataDirectory)))
+            {
+                TreeView tree = Field<TreeView>(reopened, "navigation");
+                TreeNode repositories = tree.Nodes["repositories"];
+                tree.SelectedNode = repositories.Nodes.Cast<TreeNode>().Single(node => node.Text == first.Name);
+                WaitForDirectoryNavigation(reopened);
+                AssertDirectory(reopened, first, firstDirectory);
+                tree.SelectedNode = repositories.Nodes.Cast<TreeNode>().Single(node => node.Text == second.Name);
+                WaitForDirectoryNavigation(reopened);
+                AssertDirectory(reopened, second, secondDirectory);
+            }
+        }
+
+        /// <summary>Asserts the repository identity and relative directory shown by the main window.</summary>
+        /// <param name="form">The browsing window.</param>
+        /// <param name="repository">The expected repository.</param>
+        /// <param name="path">The expected relative path.</param>
+        /// <returns>None.</returns>
+        private static void AssertDirectory(MainForm form, Repository repository, string path)
+        {
+            Repository active = Field<Repository>(form, "currentRepository");
+            string actualPath = Field<string>(form, "currentPath");
+            Assert(active != null && active.Id == repository.Id && actualPath == path,
+                "Expected directory " + repository.Name + "/" + path + ", got " + (active == null ? String.Empty : active.Name) + "/" + actualPath + ".");
+        }
+
+        /// <summary>Checks readable addresses in the directory and dialogs, and canonical URLs sent to the fake SVN CLI.</summary>
+        /// <returns>None.</returns>
+        private static void ReadableSvnAddress()
+        {
+            const string relativePath = "部署文档/增值模块%20#与@";
+            AppStore store = NewStore("readable-svn-address");
+            Repository repository = AddRepository(store, "readable-address", "Readable address", String.Empty);
+            repository.Url += "/" + Uri.EscapeDataString("仓库资料");
+            const string expected = "https://offline.invalid/readable-address/仓库资料/部署文档/增值模块%2520%23与%40";
+            string canonical = SvnService.BuildUrl(repository, relativePath);
+            using (MainForm form = OpenMain(store))
+            {
+                Pump((Task)Call(form, "NavigateAsync", repository, relativePath));
+                Assert(Field<TextBox>(form, "address").Text == expected, "The directory address did not decode Chinese or changed reserved escapes.");
+            }
+            using (RevisionHistoryDialog dialog = new RevisionHistoryDialog(new SvnService(store, Application.ExecutablePath), repository, relativePath, DefaultUiFontSize))
+            {
+                TextBox address = ControlTree(dialog).OfType<TextBox>().Single(control => control.AccessibleName == "提交记录目标地址");
+                Assert(address.ReadOnly && address.Text == expected, "The history address did not match the directory's readable address.");
+                Pump((Task)Call(dialog, "LoadHistoryAsync", false));
+                Assert(Field<ListView>(dialog, "_revisions").Items.Count == 1, "The readable history address prevented loading its revision.");
+            }
+            using (AddItemsDialog dialog = new AddItemsDialog(store, new SvnService(store, Application.ExecutablePath), repository, relativePath, DefaultUiFontSize))
+            {
+                TextBox target = ControlTree(dialog).OfType<TextBox>().Single(control => control.AccessibleName == "新增目标目录和地址");
+                Assert(target.ReadOnly && target.Text == repository.Name + "  /  " + relativePath + Environment.NewLine + expected,
+                    "The add dialog did not show the readable target directory and address.");
+            }
+            string[][] commands = Directory.GetFiles(store.DataDirectory, "fake-svn-call-*.txt").Select(File.ReadAllLines).ToArray();
+            Assert(commands.Any(command => command[0] == "list" && command[1] == canonical + "@HEAD") &&
+                commands.Any(command => command[0] == "info" && command[1] == canonical + "@HEAD") &&
+                commands.Any(command => command[0] == "log" && command[1] == canonical + "@7"),
+                "A directory or history request sent a display address to the SVN CLI.");
+        }
+
         private static int FakeSvn(string[] args)
         {
-            File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "fake-svn-call-" + Guid.NewGuid().ToString("N") + ".txt"), args[0]);
+            File.WriteAllLines(Path.Combine(Environment.CurrentDirectory, "fake-svn-call-" + Guid.NewGuid().ToString("N") + ".txt"), new[] { args[0], args[args.Length - 1] });
             Console.OutputEncoding = new UTF8Encoding(false);
             if (args[0] == "cat") { Console.Write(Payload); return 0; }
+            const string logOperation = "log";
+            if (args[0] == logOperation)
+            {
+                Console.Write("<?xml version=\"1.0\"?><log><logentry revision=\"7\"><author>offline</author><date>2026-11-02T02:30:00Z</date><msg>offline history</msg></logentry></log>");
+                return 0;
+            }
             const string infoOperation = "info";
             const string submissionName = "manual.txt";
             if (args[0] == infoOperation && args[args.Length - 1].IndexOf(submissionName, StringComparison.Ordinal) >= 0)

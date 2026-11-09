@@ -23,6 +23,11 @@ namespace LightSvnBrowser
         private const int ModifiedColumn = 3;
         private const string FavoritesKey = "favorites";
         private const string RepositoriesKey = "repositories";
+        private const string SearchKey = "search";
+        private const string RepositoryKey = "repository";
+        private const string GroupKey = "group";
+        private const int AllRepositoriesScope = 1;
+        private const int CurrentDirectoryScope = 2;
         private static readonly Color Accent = Color.FromArgb(37, 99, 235);
         private static readonly Color Ink = Color.FromArgb(30, 41, 59);
         private static readonly Color Muted = Color.FromArgb(100, 116, 139);
@@ -37,10 +42,12 @@ namespace LightSvnBrowser
         { ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp", ".rtf", ".wps", ".et", ".dps", ".vsd", ".vsdx", ".xmind" };
 
         private readonly AppStore store;
+        private readonly RepositoryNavigationStore recentDirectories;
         private SvnService service;
         private FilenameSearchEngine searchEngine;
         private TreeView navigation;
         private ListView files;
+        private Label searchLabel;
         private TextBox search;
         private ComboBox scope;
         private TextBox address;
@@ -55,6 +62,7 @@ namespace LightSvnBrowser
         private ProgressBar progress;
         private Button cancel;
         private Button up;
+        private Button goToRoot;
         private Button back;
         private Button forward;
         private Button editRepository;
@@ -63,7 +71,11 @@ namespace LightSvnBrowser
         private Button download;
         private Button favorite;
         private Button submitFile;
+        private Button addItems;
+        private Button directoryHistory;
         private ToolStripMenuItem submitFileMenuItem;
+        private ToolStripMenuItem locateMenuItem;
+        private ToolStripMenuItem selectionHistoryMenuItem;
         private CancellationTokenSource operation;
         private CancellationTokenSource previewOperation;
         private Repository currentRepository;
@@ -75,6 +87,9 @@ namespace LightSvnBrowser
         private Image currentImage;
         private bool restoringHistory;
         private NavigationState currentView;
+        private NavigationState repositoryView;
+        private NavigationState favoritesView;
+        private NavigationState searchView;
         private List<FileItem> displayedEntries = new List<FileItem>();
         private ColumnLayout columnLayout;
         private int sortColumn = UnsortedColumn;
@@ -163,6 +178,7 @@ namespace LightSvnBrowser
         public MainForm(AppStore appStore, SvnService svnService)
         {
             store = appStore;
+            recentDirectories = new RepositoryNavigationStore(store);
             service = svnService;
             searchEngine = new FilenameSearchEngine(store, service);
             Text = "Light SVN Browser · 轻量 SVN 文档浏览器";
@@ -232,7 +248,8 @@ namespace LightSvnBrowser
             searchBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 168));
             searchBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
             searchBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 136));
-            searchBar.Controls.Add(new Label { Text = "文件名搜索", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
+            searchLabel = new Label { Text = "文件名搜索", AutoSize = true, Anchor = AnchorStyles.Left };
+            searchBar.Controls.Add(searchLabel, 0, 0);
             search = new TextBox { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 10, 0), Font = new Font(Font.FontFamily, 10F), AccessibleName = "文件名关键词" };
             search.KeyDown += async delegate(object sender, KeyEventArgs args)
             {
@@ -266,17 +283,20 @@ namespace LightSvnBrowser
             add.Dock = DockStyle.Fill;
             add.Click += delegate { AddOrEditRepository(null); };
             sidebar.Controls.Add(add, 0, 0);
-            navigation = new TreeView { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, BackColor = sidebar.BackColor, ForeColor = Ink, HideSelection = false, FullRowSelect = true, ShowLines = false, ShowRootLines = false, ItemHeight = 32, Indent = 17, Margin = new Padding(0, 15, 0, 8), AccessibleName = "仓库和收藏导航" };
+            navigation = new TreeView { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, BackColor = sidebar.BackColor, ForeColor = Ink, HideSelection = false, FullRowSelect = true, ShowLines = false, ShowRootLines = false, ItemHeight = 32, Indent = 17, Margin = new Padding(0, 15, 0, 8), AccessibleName = "收藏、搜索和仓库导航" };
             navigation.AfterSelect += async delegate(object sender, TreeViewEventArgs args)
             {
                 if (rebuildingNavigation || demoMode) return;
                 NavigationItem item = args.Node.Tag as NavigationItem;
                 if (item == null) return;
-                if (item.Kind == FavoritesKey) ShowFavorites();
-                else if (item.Repository != null) await NavigateAsync(item.Repository, String.Empty);
+                if (item.Kind == FavoritesKey) SwitchView(favoritesView, ViewKind.Favorites);
+                else if (item.Kind == SearchKey) SwitchView(searchView, ViewKind.Search);
+                else if (item.Kind == RepositoriesKey && !IsRepositoryView(currentView)) SwitchView(repositoryView, ViewKind.Repositories);
+                else if (item.Repository != null) await OpenRepositoryAsync(item.Repository);
                 else ShowRepositories(item.Group);
             };
             ContextMenuStrip treeMenu = new ContextMenuStrip();
+            treeMenu.Items.Add("查看仓库列表", null, delegate { ShowRepositories(); });
             treeMenu.Items.Add("添加仓库", null, delegate { AddOrEditRepository(null); });
             treeMenu.Items.Add("编辑选中仓库", null, delegate { if (SelectedRepository() != null) AddOrEditRepository(SelectedRepository()); });
             treeMenu.Items.Add("删除选中仓库", null, delegate { DeleteRepository(); });
@@ -293,8 +313,9 @@ namespace LightSvnBrowser
             workspace.RowStyles.Add(new RowStyle(SizeType.Absolute, 27));
             workspace.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             outer.Panel2.Controls.Add(workspace);
-            TableLayoutPanel toolbar = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 7, Margin = Padding.Empty };
+            TableLayoutPanel toolbar = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 8, Margin = Padding.Empty };
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 106));
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 66));
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 66));
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
@@ -303,35 +324,51 @@ namespace LightSvnBrowser
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88));
             pageTitle = new Label { Text = "我的仓库", Font = new Font(Font.FontFamily, 12F, FontStyle.Bold), AutoSize = false, AutoEllipsis = true, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
             toolbar.Controls.Add(pageTitle, 0, 0);
+            goToRoot = MakeButton("回到根目录", false);
+            goToRoot.Click += async delegate
+            {
+                Repository repository = RootNavigationRepository();
+                if (repository != null) await NavigateAsync(repository, String.Empty);
+            };
+            toolbar.Controls.Add(goToRoot, 1, 0);
             back = MakeButton("后退", false);
             back.Width = 60;
             back.Click += delegate { GoBack(); };
-            toolbar.Controls.Add(back, 1, 0);
+            toolbar.Controls.Add(back, 2, 0);
             forward = MakeButton("前进", false);
             forward.Width = 60;
             forward.Click += delegate { GoForward(); };
-            toolbar.Controls.Add(forward, 2, 0);
+            toolbar.Controls.Add(forward, 3, 0);
             up = MakeButton("上一级", false);
             up.Click += async delegate { await UpAsync(); };
-            toolbar.Controls.Add(up, 3, 0);
+            toolbar.Controls.Add(up, 4, 0);
             Button refresh = MakeButton("刷新", false);
-            refresh.Click += async delegate
-            {
-                if (currentRepository != null && !showingFavorites) await NavigateAsync(currentRepository, currentPath);
-                else if (showingFavorites) ShowFavorites(); else ShowRepositories();
-            };
-            toolbar.Controls.Add(refresh, 4, 0);
+            refresh.Click += async delegate { await RefreshViewAsync(); };
+            toolbar.Controls.Add(refresh, 5, 0);
             editRepository = MakeButton("编辑仓库", false);
             editRepository.Click += delegate { if (SelectedRepository() != null) AddOrEditRepository(SelectedRepository()); };
-            toolbar.Controls.Add(editRepository, 5, 0);
+            toolbar.Controls.Add(editRepository, 6, 0);
             removeRepository = MakeButton("删除仓库", false);
             removeRepository.Click += delegate { DeleteRepository(); };
-            toolbar.Controls.Add(removeRepository, 6, 0);
+            toolbar.Controls.Add(removeRepository, 7, 0);
             operationButtons.Add(refresh);
             workspace.Controls.Add(toolbar, 0, 0);
 
             address = new TextBox { Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(248, 250, 252), Margin = new Padding(0, 5, 0, 4), AccessibleName = "当前路径" };
-            workspace.Controls.Add(address, 0, 1);
+            TableLayoutPanel locationBar = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, Margin = Padding.Empty };
+            locationBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            locationBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88));
+            locationBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 136));
+            locationBar.Controls.Add(address, 0, 0);
+            addItems = MakeButton("新增…", false);
+            addItems.Dock = DockStyle.Fill;
+            addItems.Click += async delegate { await AddToDirectoryAsync(); };
+            locationBar.Controls.Add(addItems, 1, 0);
+            directoryHistory = MakeButton("当前目录记录…", false);
+            directoryHistory.Dock = DockStyle.Fill;
+            directoryHistory.Click += delegate { if (CanUseDirectoryActions()) ShowRevisionHistory(currentRepository, currentPath); };
+            locationBar.Controls.Add(directoryHistory, 2, 0);
+            workspace.Controls.Add(locationBar, 0, 1);
             indexStatus = new Label { Text = "添加仓库后即可浏览；首次搜索会建立文件名索引。", ForeColor = Muted, AutoSize = true, Anchor = AnchorStyles.Left };
             workspace.Controls.Add(indexStatus, 0, 2);
 
@@ -361,6 +398,16 @@ namespace LightSvnBrowser
             };
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("临时查看 / 打开文件夹", null, async delegate { await ActivateSelectionAsync(); });
+            locateMenuItem = new ToolStripMenuItem("跳转到仓库中的位置");
+            locateMenuItem.Click += async delegate { await LocateSelectionAsync(); };
+            menu.Items.Add(locateMenuItem);
+            selectionHistoryMenuItem = new ToolStripMenuItem("查看提交记录…");
+            selectionHistoryMenuItem.Click += delegate
+            {
+                FileItem item = SelectedFile();
+                if (item != null) ShowRevisionHistory(item.Repository, item.Entry.Path);
+            };
+            menu.Items.Add(selectionHistoryMenuItem);
             menu.Items.Add("下载到…", null, async delegate { await DownloadSelectionAsync(); });
             submitFileMenuItem = new ToolStripMenuItem("提交新版本…");
             submitFileMenuItem.Click += async delegate { await SubmitSelectionAsync(); };
@@ -482,9 +529,9 @@ namespace LightSvnBrowser
             try
             {
                 navigation.Nodes.Clear();
-                TreeNode favoriteNode = new TreeNode("★ 我的收藏  (" + store.Config.Favorites.Count + ")") { Tag = new NavigationItem { Kind = FavoritesKey } };
-                navigation.Nodes.Add(favoriteNode);
-                TreeNode root = new TreeNode("▣ 我的仓库") { Tag = new NavigationItem { Kind = RepositoriesKey, Group = String.Empty } };
+                navigation.Nodes.Add(new TreeNode("★ 我的收藏  (" + store.Config.Favorites.Count + ")") { Name = FavoritesKey, Tag = new NavigationItem { Kind = FavoritesKey } });
+                navigation.Nodes.Add(new TreeNode("⌕ 搜索结果") { Name = SearchKey, Tag = new NavigationItem { Kind = SearchKey } });
+                TreeNode root = new TreeNode("▣ 我的仓库") { Name = RepositoriesKey, Tag = new NavigationItem { Kind = RepositoriesKey, Group = String.Empty } };
                 navigation.Nodes.Add(root);
                 Dictionary<string, TreeNode> groups = new Dictionary<string, TreeNode>(StringComparer.OrdinalIgnoreCase);
                 groups[String.Empty] = root;
@@ -498,21 +545,21 @@ namespace LightSvnBrowser
                         TreeNode groupNode;
                         if (!groups.TryGetValue(group, out groupNode))
                         {
-                            groupNode = new TreeNode(part) { Tag = new NavigationItem { Kind = "group", Group = group } };
+                            groupNode = new TreeNode(part) { Tag = new NavigationItem { Kind = GroupKey, Group = group } };
                             parent.Nodes.Add(groupNode);
                             groups[group] = groupNode;
                         }
                         parent = groupNode;
                     }
-                    TreeNode node = new TreeNode(repository.Name) { Tag = new NavigationItem { Kind = "repository", Repository = repository }, ToolTipText = repository.Url };
+                    TreeNode node = new TreeNode(repository.Name) { Tag = new NavigationItem { Kind = RepositoryKey, Repository = repository }, ToolTipText = SvnService.BuildDisplayUrl(repository, String.Empty) };
                     parent.Nodes.Add(node);
                     if (repository.Id == selectedRepositoryId) navigation.SelectedNode = node;
                 }
                 root.ExpandAll();
-                if (showingFavorites) navigation.SelectedNode = favoriteNode;
-                else if (navigation.SelectedNode == null) navigation.SelectedNode = root;
+                if (navigation.SelectedNode == null) navigation.SelectedNode = root;
             }
             finally { navigation.EndUpdate(); rebuildingNavigation = false; }
+            if (currentView != null && !demoMode) SelectNavigationForView(currentView);
             UpdateActions();
         }
 
@@ -538,6 +585,8 @@ namespace LightSvnBrowser
                 }
                 else store.Config.Repositories.Add(result);
                 store.Save();
+                if (existing != null && SvnService.BuildUrl(existing, String.Empty) != SvnService.BuildUrl(result, String.Empty))
+                    recentDirectories.Forget(existing);
                 ClearHistory();
                 store.Log("repository.save", "id=" + result.Id + "; edited=" + (existing != null));
                 currentRepository = result;
@@ -560,6 +609,7 @@ namespace LightSvnBrowser
             store.Config.Favorites.RemoveAll(f => f.RepositoryId == repository.Id);
             store.DeleteIndex(repository.Id);
             store.Save();
+            recentDirectories.Forget(repository);
             ClearHistory();
             store.Log("repository.remove", "id=" + repository.Id);
             currentRepository = null;
@@ -572,7 +622,7 @@ namespace LightSvnBrowser
         private void ShowRepositories(string group = null)
         {
             CaptureViewPosition();
-            CancelOperation();
+            CancelViewOperation();
             CancelPreview();
             showingFavorites = false;
             search.Text = String.Empty;
@@ -585,12 +635,13 @@ namespace LightSvnBrowser
             {
                 ListViewItem row = new ListViewItem(repository.Name, 0) { Tag = repository };
                 row.SubItems.Add(repository.Group ?? String.Empty);
-                row.SubItems.Add(repository.Url);
+                row.SubItems.Add(SvnService.BuildDisplayUrl(repository, String.Empty));
                 row.SubItems.Add(repository.Username ?? String.Empty);
                 files.Items.Add(row);
             }
             if (!restoringHistory) ApplyColumnSort(false);
             indexStatus.Text = store.Config.Repositories.Count == 0 ? "点击左侧“添加 SVN 仓库”。分组填写“团队/产品”即可形成文件夹。" : "双击仓库进入目录；在左侧按文件夹组织多个地址。";
+            status.Text = files.Items.Count + " 个仓库 · 数据目录：" + store.DataDirectory;
             ClearDetails();
             CommitView(ViewKind.Repositories, group);
             UpdateActions();
@@ -676,6 +727,7 @@ namespace LightSvnBrowser
 
         private void CommitView(ViewKind kind, string group = null, string executedQuery = null, int? executedScope = null)
         {
+            if (restoringHistory) return;
             NavigationState next = new NavigationState
             {
                 Kind = kind, RepositoryId = currentRepository == null ? null : currentRepository.Id,
@@ -684,24 +736,66 @@ namespace LightSvnBrowser
                 Entries = kind == ViewKind.Directory || kind == ViewKind.Search ? displayedEntries : null,
                 SortColumn = sortColumn, SortDescending = sortDescending
             };
-            if (!restoringHistory && currentView != null)
+            if (currentView != null)
             {
                 bool repeated = currentView.Kind == kind && currentView.RepositoryId == next.RepositoryId &&
-                    currentView.Path == next.Path && currentView.Group == next.Group && currentView.Query == next.Query && currentView.Scope == next.Scope;
-                if (!repeated)
-                {
-                    backHistory.Add(currentView);
-                    if (backHistory.Count > MaximumHistoryViews) backHistory.RemoveAt(0);
-                    forwardHistory.Clear();
-                }
+                    currentView.Path == next.Path && currentView.Group == next.Group &&
+                    (IsRepositoryView(next) || (currentView.Query == next.Query && currentView.Scope == next.Scope));
+                if (!repeated) RecordViewChange();
             }
             currentView = next;
+            RememberView(next);
+            SelectNavigationForView(next);
             UpdateActions();
+        }
+
+        private static bool IsRepositoryView(NavigationState view)
+        {
+            return view != null && (view.Kind == ViewKind.Repositories || view.Kind == ViewKind.Directory);
+        }
+
+        private void RememberView(NavigationState view)
+        {
+            if (IsRepositoryView(view))
+            {
+                repositoryView = view;
+                if (view.Kind == ViewKind.Directory && currentRepository != null)
+                    recentDirectories.RememberPath(currentRepository, view.Path);
+            }
+            else if (view.Kind == ViewKind.Favorites) favoritesView = view;
+            else searchView = view;
+        }
+
+        private void RecordViewChange()
+        {
+            if (currentView == null) return;
+            backHistory.Add(currentView);
+            if (backHistory.Count > MaximumHistoryViews) backHistory.RemoveAt(0);
+            forwardHistory.Clear();
+        }
+
+        private void SwitchView(NavigationState target, ViewKind kind)
+        {
+            if (target == currentView && target != null) return;
+            if (target == null)
+            {
+                if (kind == ViewKind.Favorites) ShowFavorites();
+                else if (kind == ViewKind.Search) ShowEmptySearch();
+                else ShowRepositories();
+                return;
+            }
+            CaptureViewPosition();
+            RecordViewChange();
+            RestoreView(target);
+            store.Log("navigation.workspace", "kind=" + target.Kind + "; repository=" + target.RepositoryId + "; path=" + target.Path);
         }
 
         private void ClearHistory()
         {
             currentView = null;
+            repositoryView = null;
+            favoritesView = null;
+            searchView = null;
             backHistory.Clear();
             forwardHistory.Clear();
         }
@@ -714,10 +808,17 @@ namespace LightSvnBrowser
         {
             if (source.Count == 0 || operation != null) return;
             CaptureViewPosition();
-            CancelPreview();
             NavigationState target = source[source.Count - 1];
             source.RemoveAt(source.Count - 1);
             if (currentView != null) destination.Add(currentView);
+            RestoreView(target);
+            store.Log("navigation.history", "kind=" + target.Kind + "; back=" + backHistory.Count + "; forward=" + forwardHistory.Count);
+        }
+
+        private void RestoreView(NavigationState target)
+        {
+            CancelViewOperation();
+            CancelPreview();
             restoringHistory = true;
             try
             {
@@ -727,7 +828,7 @@ namespace LightSvnBrowser
                 else if (target.Kind == ViewKind.Favorites) ShowFavorites(target.Query);
                 else
                 {
-                    currentRepository = store.Config.Repositories.FirstOrDefault(repository => repository.Id == target.RepositoryId);
+                    currentRepository = FindViewRepository(target);
                     currentPath = target.Path ?? String.Empty;
                     showingFavorites = false;
                     PopulateEntries(target.Entries ?? new List<FileItem>(), true);
@@ -737,6 +838,7 @@ namespace LightSvnBrowser
                 sortDescending = target.SortDescending;
                 ApplyColumnSort(false);
                 currentView = target;
+                RememberView(target);
                 search.Text = target.Query ?? String.Empty;
                 pageTitle.Text = target.Title;
                 address.Text = target.Address;
@@ -744,7 +846,6 @@ namespace LightSvnBrowser
                 status.Text = target.Status;
                 RestoreViewPosition(target);
                 SelectNavigationForView(target);
-                store.Log("navigation.history", "kind=" + target.Kind + "; back=" + backHistory.Count + "; forward=" + forwardHistory.Count);
             }
             finally { restoringHistory = false; UpdateActions(); }
         }
@@ -763,9 +864,7 @@ namespace LightSvnBrowser
                 FileItem selected = SelectedFile();
                 if (selected != null && updateDetails)
                 {
-                    detailTitle.Text = selected.Favorite == null ? selected.Entry.Name : selected.Favorite.Name;
-                    detailMeta.Text = selected.Repository.Name + "\n" + selected.Entry.Path;
-                    SetPreviewText("已恢复上次列表和选择位置。\r\n双击可临时查看，或继续选择其他搜索结果。");
+                    SetSelectionDetails(selected);
                 }
             }
             finally { suppressSelectionPreview = previousSuppression; }
@@ -784,9 +883,9 @@ namespace LightSvnBrowser
                         NavigationItem item = node.Tag as NavigationItem;
                         if (item == null) continue;
                         if (view.Kind == ViewKind.Favorites && item.Kind == FavoritesKey) selected = node;
-                        else if (view.Kind == ViewKind.Search && view.RepositoryId == null && item.Kind == RepositoriesKey) selected = node;
-                        else if (view.Kind == ViewKind.Repositories && item.Repository == null && item.Group == (view.Group ?? String.Empty) && item.Kind != FavoritesKey) selected = node;
-                        else if (view.RepositoryId != null && item.Repository != null && item.Repository.Id == view.RepositoryId) selected = node;
+                        else if (view.Kind == ViewKind.Search && item.Kind == SearchKey) selected = node;
+                        else if (view.Kind == ViewKind.Repositories && (item.Kind == RepositoriesKey || item.Kind == GroupKey) && item.Group == view.Group) selected = node;
+                        else if (view.Kind == ViewKind.Directory && item.Repository != null && item.Repository.Id == view.RepositoryId) selected = node;
                     }
                 }
                 if (selected != null) navigation.SelectedNode = selected;
@@ -801,28 +900,76 @@ namespace LightSvnBrowser
                 foreach (TreeNode descendant in EnumerateNodes(child)) yield return descendant;
         }
 
-        private async Task NavigateAsync(Repository repository, string relativePath)
+        private Task NavigateAsync(Repository repository, string relativePath)
+        {
+            return LoadDirectoryAsync(repository, relativePath);
+        }
+
+        private Task OpenRepositoryAsync(Repository repository)
+        {
+            return NavigateAsync(repository, recentDirectories.GetPath(repository));
+        }
+
+        private async Task LoadDirectoryAsync(Repository repository, string relativePath, SvnEntry locate = null)
         {
             if (repository == null) return;
             CaptureViewPosition();
             CancelPreview();
             string targetPath = relativePath ?? String.Empty;
-            await RunOperationAsync("正在读取目录…", async token =>
+            await RunOperationAsync(locate == null ? "正在读取目录…" : "正在定位仓库位置…", async token =>
             {
                 List<SvnEntry> entries = await service.ListAsync(repository, targetPath, false, token);
                 token.ThrowIfCancellationRequested();
+                if (locate != null && !entries.Any(entry => entry.Path == locate.Path && entry.IsDirectory == locate.IsDirectory))
+                    throw new FileNotFoundException("目标已删除、移动或类型已变化，请更新搜索索引或收藏后再定位。");
+                NavigationState previous = repositoryView;
+                if (!IsRepositoryView(currentView))
+                {
+                    search.Text = previous == null ? String.Empty : previous.Query;
+                    if (previous != null) scope.SelectedIndex = previous.Scope;
+                    if (previous != null && previous.Kind == ViewKind.Directory)
+                        columnSorts[ColumnLayout.Files] = new ColumnSortState { Column = previous.SortColumn, Descending = previous.SortDescending };
+                }
                 currentRepository = repository;
                 currentPath = targetPath;
                 showingFavorites = false;
                 pageTitle.Text = repository.Name;
-                address.Text = SvnService.BuildUrl(repository, targetPath);
+                address.Text = SvnService.BuildDisplayUrl(repository, targetPath);
                 PopulateEntries(entries.Select(e => new FileItem { Repository = repository, Entry = e }));
                 DateTime? indexUpdated = store.GetIndexUpdatedUtc(repository.Id);
-                indexStatus.Text = indexUpdated == null ? "目录按需读取。首次搜索会建立文件名索引。" : "搜索索引更新于 " + indexUpdated.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm") + "；新增文件后可点击“更新搜索索引”。";
+                indexStatus.Text = indexUpdated == null ? "目录按需读取。首次搜索会建立文件名索引。" : "搜索索引更新于 " + indexUpdated.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm") + "；其他客户端的改动可手动更新索引。";
                 ClearDetails();
                 status.Text = entries.Count + " 项 · 双击文件临时查看；下载时自行选择位置。";
                 CommitView(ViewKind.Directory);
+                if (previous != null && previous.Kind == ViewKind.Directory && previous.RepositoryId == repository.Id && previous.Path == targetPath)
+                    RestoreViewPosition(previous);
+                if (locate != null)
+                {
+                    ListViewItem row = files.Items.Cast<ListViewItem>().First(item => ((FileItem)item.Tag).Entry.Path == locate.Path);
+                    suppressSelectionPreview = true;
+                    try
+                    {
+                        files.SelectedItems.Clear();
+                        row.Selected = true;
+                        row.Focused = true;
+                        row.EnsureVisible();
+                        files.Focus();
+                    }
+                    finally { suppressSelectionPreview = false; }
+                    SetSelectionDetails((FileItem)row.Tag);
+                    CaptureViewPosition();
+                    status.Text = "已定位 · " + locate.Path;
+                    store.Log("navigation.locate", "repository=" + repository.Id + "; path=" + locate.Path);
+                }
             });
+        }
+
+        private Task LocateSelectionAsync()
+        {
+            FileItem item = SelectedFile();
+            if (!CanLocate(item)) return Task.FromResult(false);
+            string path = item.Entry.Path;
+            return LoadDirectoryAsync(item.Repository, ParentPath(path), String.IsNullOrEmpty(path) ? null : item.Entry);
         }
 
         private void PopulateEntries(IEnumerable<FileItem> entries)
@@ -860,17 +1007,64 @@ namespace LightSvnBrowser
 
         private async Task UpAsync()
         {
-            if (currentRepository == null || showingFavorites) return;
+            if (!CanUseDirectoryActions()) return;
             if (String.IsNullOrEmpty(currentPath)) { ShowRepositories(); return; }
-            int separator = currentPath.LastIndexOf('/');
-            await NavigateAsync(currentRepository, separator < 0 ? String.Empty : currentPath.Substring(0, separator));
+            await NavigateAsync(currentRepository, ParentPath(currentPath));
         }
 
-        private List<Repository> SearchRepositories()
+        private static string ParentPath(string path)
         {
-            const int allRepositoriesScope = 1;
-            if (scope.SelectedIndex == allRepositoriesScope) return store.Config.Repositories.ToList();
-            Repository repository = currentRepository ?? SelectedRepository();
+            int separator = path.LastIndexOf('/');
+            return separator < 0 ? String.Empty : path.Substring(0, separator);
+        }
+
+        private async Task RefreshViewAsync()
+        {
+            if (currentView == null) return;
+            NavigationState previous = currentView;
+            if (previous.Kind == ViewKind.Directory) await NavigateAsync(currentRepository, currentPath);
+            else if (previous.Kind == ViewKind.Favorites) ShowFavorites(previous.Query);
+            else if (previous.Kind == ViewKind.Repositories)
+            {
+                ShowRepositories(previous.Group);
+                RestoreViewPosition(previous);
+            }
+            else if (!String.IsNullOrWhiteSpace(previous.Query))
+            {
+                search.Text = previous.Query;
+                scope.SelectedIndex = previous.Scope;
+                await ExecuteSearchAsync(previous.Query, previous.Scope, previous, previous);
+            }
+        }
+
+        private void ShowEmptySearch()
+        {
+            CaptureViewPosition();
+            CancelViewOperation();
+            CancelPreview();
+            currentRepository = FindViewRepository(repositoryView);
+            currentPath = currentRepository == null ? String.Empty : repositoryView.Path;
+            showingFavorites = false;
+            search.Text = String.Empty;
+            if (currentRepository == null) scope.SelectedIndex = AllRepositoriesScope;
+            pageTitle.Text = "搜索结果";
+            address.Text = "文件名搜索";
+            PopulateEntries(Enumerable.Empty<FileItem>());
+            indexStatus.Text = "选择搜索范围并输入文件名关键词；首次搜索会建立文件名索引。";
+            status.Text = "等待搜索。";
+            ClearDetails();
+            CommitView(ViewKind.Search);
+            search.Focus();
+        }
+
+        private Repository FindViewRepository(NavigationState view)
+        {
+            return view == null ? null : store.Config.Repositories.FirstOrDefault(repository => repository.Id == view.RepositoryId);
+        }
+
+        private List<Repository> SearchRepositories(int searchScope, Repository repository)
+        {
+            if (searchScope == AllRepositoriesScope) return store.Config.Repositories.ToList();
             return repository == null ? new List<Repository>() : new List<Repository> { repository };
         }
 
@@ -882,13 +1076,18 @@ namespace LightSvnBrowser
                 ShowFavorites(query);
                 return;
             }
-            List<Repository> repositories = SearchRepositories();
+            await ExecuteSearchAsync(query, scope.SelectedIndex, repositoryView);
+        }
+
+        private async Task ExecuteSearchAsync(string query, int queryScope, NavigationState origin, NavigationState previous = null)
+        {
+            Repository repository = FindViewRepository(origin);
+            List<Repository> repositories = SearchRepositories(queryScope, repository);
             if (repositories.Count == 0) { MessageBox.Show(this, "请选择一个仓库，或把搜索范围切换为“所有仓库”。", "文件名搜索"); return; }
             if (query.Length == 0) { MessageBox.Show(this, "请输入文件名关键词。多个关键词可用空格分隔。", "文件名搜索"); return; }
-            const int currentDirectoryScope = 2;
-            string pathPrefix = scope.SelectedIndex == currentDirectoryScope ? currentPath : String.Empty;
-            string scopeName = scope.Text;
-            int queryScope = scope.SelectedIndex;
+            string originPath = repository == null ? String.Empty : origin.Path;
+            string pathPrefix = queryScope == CurrentDirectoryScope ? originPath : String.Empty;
+            string scopeName = (string)scope.Items[queryScope];
             CaptureViewPosition();
             CancelPreview();
             await RunOperationAsync("正在搜索文件名…", async token =>
@@ -899,21 +1098,28 @@ namespace LightSvnBrowser
                 });
                 FilenameSearchResult result = await searchEngine.SearchAsync(repositories, query, pathPrefix, ResultLimit, searchProgress.Report, token);
                 token.ThrowIfCancellationRequested();
+                currentRepository = repository;
+                currentPath = originPath;
                 pageTitle.Text = "搜索结果 · " + query;
-                address.Text = scopeName + (pathPrefix.Length == 0 ? String.Empty : " / " + pathPrefix);
+                address.Text = scopeName + (queryScope == AllRepositoriesScope ? String.Empty : " · " + repositories[0].Name) +
+                    (pathPrefix.Length == 0 ? String.Empty : " / " + pathPrefix);
                 Stopwatch renderTimer = Stopwatch.StartNew();
+                if (currentView.Kind != ViewKind.Search && searchView != null)
+                    columnSorts[ColumnLayout.Files] = new ColumnSortState { Column = searchView.SortColumn, Descending = searchView.SortDescending };
                 PopulateEntries(result.Matches.Select(match => new FileItem { Repository = match.Repository, Entry = match.Entry }), true);
                 renderTimer.Stop();
-                indexStatus.Text = "索引最早更新于 " + result.OldestIndexUpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm") + "；新增文件后可更新索引。";
+                indexStatus.Text = "索引最早更新于 " + result.OldestIndexUpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm") + "；其他客户端的改动可手动更新索引。";
                 status.Text = "找到 " + result.TotalCount + " 项 · 搜索 " + result.ElapsedMilliseconds + " ms，显示 " + renderTimer.ElapsedMilliseconds + " ms" + (result.TotalCount > ResultLimit ? " · 仅展示前 " + ResultLimit + " 项。" : String.Empty);
                 ClearDetails();
                 CommitView(ViewKind.Search, null, query, queryScope);
+                if (previous != null) RestoreViewPosition(previous);
             });
         }
 
         private async Task RefreshIndexAsync()
         {
-            List<Repository> repositories = SearchRepositories();
+            NavigationState origin = currentView != null && currentView.Kind == ViewKind.Search && !String.IsNullOrEmpty(currentView.Query) ? currentView : repositoryView;
+            List<Repository> repositories = SearchRepositories(scope.SelectedIndex, FindViewRepository(origin));
             if (repositories.Count == 0) { MessageBox.Show(this, "请选择仓库，或把范围设为“所有仓库”。", "更新索引"); return; }
             await RunOperationAsync("正在更新目录索引…", async token =>
             {
@@ -926,6 +1132,7 @@ namespace LightSvnBrowser
                 }
                 token.ThrowIfCancellationRequested();
                 indexStatus.Text = "搜索索引已更新：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + "。";
+                if (currentView != null) currentView.IndexStatus = indexStatus.Text;
                 status.Text = "已更新 " + repositories.Count + " 个仓库，共 " + count + " 项目录信息。";
             });
         }
@@ -933,7 +1140,8 @@ namespace LightSvnBrowser
         private void ShowFavorites(string query = null)
         {
             CaptureViewPosition();
-            CancelOperation();
+            NavigationState previous = currentView;
+            CancelViewOperation();
             CancelPreview();
             showingFavorites = true;
             search.Text = query ?? String.Empty;
@@ -961,6 +1169,8 @@ namespace LightSvnBrowser
             status.Text = files.Items.Count + " 个收藏 · 在顶部搜索框查找名称、标签或备注。";
             ClearDetails();
             CommitView(ViewKind.Favorites);
+            if (!restoringHistory && previous != null && previous.Kind == ViewKind.Favorites && previous.Query == search.Text)
+                RestoreViewPosition(previous);
             UpdateActions();
         }
 
@@ -975,13 +1185,7 @@ namespace LightSvnBrowser
             FileItem item = SelectedFile();
             UpdateActions();
             if (item == null) { ClearDetails(); return; }
-            Favorite saved = store.Config.Favorites.FirstOrDefault(f => f.RepositoryId == item.Repository.Id && f.Path == item.Entry.Path);
-            detailTitle.Text = item.Favorite == null ? item.Entry.Name : item.Favorite.Name;
-            detailMeta.Text = item.Repository.Name + "\n" + (item.Entry.IsDirectory ? "文件夹" : FormatSize(item.Entry.Size)) +
-                (String.IsNullOrEmpty(item.Entry.Revision) ? String.Empty : " · r" + item.Entry.Revision) + "\n" + item.Entry.Path;
-            detailNotes.Text = saved == null ? "尚未收藏。可添加标签与备注，方便下次查找。" : "标签：" + saved.Tags + "\n备注：" + saved.Note;
-            favorite.Text = saved == null ? "收藏" : "编辑收藏";
-            SetPreviewText(item.Entry.IsDirectory ? "双击进入文件夹。\r\n文件夹也可以添加到收藏。" : "双击临时查看。\r\n\r\nOffice / PDF 使用本机默认程序打开临时副本。\r\n需要保留文件时，请点击“下载到…”。");
+            SetSelectionDetails(item);
             if (item.Entry.IsDirectory || demoMode) return;
             string extension = Path.GetExtension(item.Entry.Path);
             bool isText = TextExtensions.Contains(extension) || extension.Length == 0;
@@ -1016,11 +1220,22 @@ namespace LightSvnBrowser
             }
         }
 
+        private void SetSelectionDetails(FileItem item)
+        {
+            Favorite saved = store.Config.Favorites.FirstOrDefault(f => f.RepositoryId == item.Repository.Id && f.Path == item.Entry.Path);
+            detailTitle.Text = item.Favorite == null ? item.Entry.Name : item.Favorite.Name;
+            detailMeta.Text = item.Repository.Name + "\n" + (item.Entry.IsDirectory ? "文件夹" : FormatSize(item.Entry.Size)) +
+                (String.IsNullOrEmpty(item.Entry.Revision) ? String.Empty : " · r" + item.Entry.Revision) + "\n" + item.Entry.Path;
+            detailNotes.Text = saved == null ? "尚未收藏。可添加标签与备注，方便下次查找。" : "标签：" + saved.Tags + "\n备注：" + saved.Note;
+            favorite.Text = saved == null ? "收藏" : "编辑收藏";
+            SetPreviewText(item.Entry.IsDirectory ? "双击进入文件夹。\r\n文件夹也可以添加到收藏。" : "双击临时查看。\r\n\r\nOffice / PDF 使用本机默认程序打开临时副本。\r\n需要保留文件时，请点击“下载到…”。");
+        }
+
         private async Task ActivateSelectionAsync()
         {
             if (files.SelectedItems.Count == 0) return;
             Repository repository = files.SelectedItems[0].Tag as Repository;
-            if (repository != null) { await NavigateAsync(repository, String.Empty); return; }
+            if (repository != null) { await OpenRepositoryAsync(repository); return; }
             FileItem item = SelectedFile();
             if (item == null) return;
             if (item.Entry.IsDirectory) { await NavigateAsync(item.Repository, item.Entry.Path); return; }
@@ -1122,6 +1337,43 @@ namespace LightSvnBrowser
             }
         }
 
+        private async Task AddToDirectoryAsync()
+        {
+            if (!CanUseDirectoryActions()) return;
+            CancelPreview();
+            Repository repository = currentRepository;
+            string path = currentPath;
+            using (AddItemsDialog dialog = new AddItemsDialog(store, service, repository, path, store.Config.UiFontSize))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK || dialog.Result == null) return;
+                SubmissionResult result = dialog.Result;
+                store.Log("addition.ui.complete", "repository=" + repository.Id + "; path=" + path + "; revision=" + result.Revision);
+                NavigationState submittedView = currentView;
+                await NavigateAsync(repository, path);
+                if (currentView.Kind == ViewKind.Directory && currentView.RepositoryId == repository.Id && currentView.Path == path)
+                {
+                    string refreshMessage = currentView == submittedView ? " 目录尚未刷新，可点击“刷新”重新读取。" : String.Empty;
+                    status.Text = result.Message + refreshMessage;
+                }
+            }
+        }
+
+        private void ShowRevisionHistory(Repository repository, string path)
+        {
+            if (repository == null || operation != null || demoMode) return;
+            CancelPreview();
+            try
+            {
+                using (RevisionHistoryDialog dialog = new RevisionHistoryDialog(service, repository, path, store.Config.UiFontSize))
+                    dialog.ShowDialog(this);
+            }
+            catch (Exception error)
+            {
+                store.Log("history.ui.error", "repository=" + repository.Id + "; path=" + path + "; error=" + error.Message);
+                ShowError(error);
+            }
+        }
+
         /// <summary>Refreshes the submitted file in visible rows and saved navigation views.</summary>
         /// <param name="repository">The repository owning the submitted file.</param>
         /// <param name="path">The unchanged repository-relative target path.</param>
@@ -1129,9 +1381,7 @@ namespace LightSvnBrowser
         /// <returns>None.</returns>
         private void RefreshSubmittedFile(Repository repository, string path, SvnEntry entry)
         {
-            IEnumerable<NavigationState> views = backHistory.Concat(forwardHistory);
-            if (currentView != null) views = views.Concat(new[] { currentView });
-            IEnumerable<FileItem> remembered = views.Where(view => view.Entries != null).SelectMany(view => view.Entries);
+            IEnumerable<FileItem> remembered = RememberedViews().Where(view => view.Entries != null).SelectMany(view => view.Entries);
             IEnumerable<FileItem> visible = files.Items.Cast<ListViewItem>().Select(row => row.Tag as FileItem).Where(file => file != null);
             foreach (FileItem file in remembered.Concat(displayedEntries).Concat(visible))
             {
@@ -1155,8 +1405,7 @@ namespace LightSvnBrowser
         private async Task ResolveFavoriteEntryAsync(FileItem item, CancellationToken token)
         {
             if (item.Favorite == null) return;
-            int separator = item.Favorite.Path.LastIndexOf('/');
-            string parent = separator < 0 ? String.Empty : item.Favorite.Path.Substring(0, separator);
+            string parent = ParentPath(item.Favorite.Path);
             List<SvnEntry> siblings = await service.ListAsync(item.Repository, parent, false, token);
             token.ThrowIfCancellationRequested();
             SvnEntry latest = siblings.FirstOrDefault(e => String.Equals(e.Path, item.Favorite.Path, StringComparison.Ordinal));
@@ -1179,7 +1428,7 @@ namespace LightSvnBrowser
                 store.Save();
                 store.Log("favorite.save", "repository=" + item.Repository.Id + "; favorite=" + dialog.Result.Id);
                 BuildNavigation(currentRepository == null ? null : currentRepository.Id);
-                if (showingFavorites) ShowFavorites(search.Text.Trim());
+                if (showingFavorites) ShowFavorites(currentView.Query);
                 else { detailNotes.Text = "标签：" + dialog.Result.Tags + "\n备注：" + dialog.Result.Note; favorite.Text = "编辑收藏"; }
                 status.Text = "收藏已保存，可从左侧“我的收藏”快速访问。";
             }
@@ -1193,7 +1442,7 @@ namespace LightSvnBrowser
             if (removed == 0) return;
             store.Save();
             BuildNavigation(currentRepository == null ? null : currentRepository.Id);
-            if (showingFavorites) ShowFavorites();
+            if (showingFavorites) ShowFavorites(currentView.Query);
             else { favorite.Text = "收藏"; detailNotes.Text = "尚未收藏。"; }
             status.Text = "已取消收藏。";
         }
@@ -1243,13 +1492,19 @@ namespace LightSvnBrowser
             {
                 UiTypography.Apply(this, fontSize);
                 float ratio = fontSize / previous;
-                foreach (NavigationState view in backHistory.Concat(forwardHistory).Concat(currentView == null ? Enumerable.Empty<NavigationState>() : new[] { currentView }))
+                foreach (NavigationState view in RememberedViews())
                     if (view.ColumnWidths != null)
                         for (int index = 0; index < view.ColumnWidths.Length; index++) view.ColumnWidths[index] = (int)Math.Round(view.ColumnWidths[index] * ratio);
                 if (currentView != null) RestoreViewPosition(currentView, false);
             }
             finally { suppressSelectionPreview = previousSuppression; }
             store.Log("ui.font.changed", "size_pt=" + fontSize.ToString(CultureInfo.InvariantCulture));
+        }
+
+        private IEnumerable<NavigationState> RememberedViews()
+        {
+            return backHistory.Concat(forwardHistory).Concat(new[] { currentView, repositoryView, favoritesView, searchView })
+                .Where(view => view != null).Distinct();
         }
 
         private void SwitchDataDirectory(string target)
@@ -1316,13 +1571,26 @@ namespace LightSvnBrowser
                 if (!pending.IsCancellationRequested && !IsDisposed)
                 {
                     store.Log("operation.error", error.Message);
-                    if (operation == pending) { operation = null; SetBusy(false, null); }
+                    if (operation == pending)
+                    {
+                        operation = null;
+                        SetBusy(false, null);
+                        if (currentView != null) SelectNavigationForView(currentView);
+                    }
                     ShowError(error);
                 }
             }
             finally
             {
-                if (operation == pending) { operation = null; if (!IsDisposed) SetBusy(false, null); }
+                if (operation == pending)
+                {
+                    operation = null;
+                    if (!IsDisposed)
+                    {
+                        SetBusy(false, null);
+                        if (currentView != null) SelectNavigationForView(currentView);
+                    }
+                }
                 pending.Dispose();
             }
         }
@@ -1341,6 +1609,14 @@ namespace LightSvnBrowser
             if (operation != null) operation.Cancel();
         }
 
+        private void CancelViewOperation()
+        {
+            if (operation == null) return;
+            CancelOperation();
+            operation = null;
+            SetBusy(false, null);
+        }
+
         private void CancelPreview()
         {
             if (previewOperation != null) previewOperation.Cancel();
@@ -1356,11 +1632,42 @@ namespace LightSvnBrowser
             bool canSubmit = item != null && !item.Entry.IsDirectory && !busy && !demoMode;
             if (submitFile != null) submitFile.Enabled = canSubmit;
             if (submitFileMenuItem != null) submitFileMenuItem.Enabled = canSubmit;
-            if (up != null) up.Enabled = currentRepository != null && !showingFavorites && !busy;
+            bool directoryActions = CanUseDirectoryActions();
+            if (up != null) up.Enabled = directoryActions;
+            if (goToRoot != null) goToRoot.Enabled = RootNavigationRepository() != null;
+            if (addItems != null) addItems.Enabled = directoryActions;
+            if (directoryHistory != null) directoryHistory.Enabled = directoryActions;
+            if (locateMenuItem != null)
+            {
+                locateMenuItem.Visible = currentView != null && !IsRepositoryView(currentView);
+                locateMenuItem.Enabled = CanLocate(item);
+            }
+            if (selectionHistoryMenuItem != null) selectionHistoryMenuItem.Enabled = item != null && !busy && !demoMode;
+            if (scope != null) scope.Enabled = !showingFavorites;
+            if (searchLabel != null) searchLabel.Text = showingFavorites ? "筛选收藏" : "文件名搜索";
             if (back != null) back.Enabled = backHistory.Count > 0 && !busy;
             if (forward != null) forward.Enabled = forwardHistory.Count > 0 && !busy;
-            if (editRepository != null) editRepository.Enabled = SelectedRepository() != null && !busy;
-            if (removeRepository != null) removeRepository.Enabled = SelectedRepository() != null && !busy;
+            bool canManageRepository = IsRepositoryView(currentView) && SelectedRepository() != null && !busy && !demoMode;
+            if (editRepository != null) editRepository.Enabled = canManageRepository;
+            if (removeRepository != null) removeRepository.Enabled = canManageRepository;
+        }
+
+        private bool CanUseDirectoryActions()
+        {
+            return currentView != null && currentView.Kind == ViewKind.Directory && currentRepository != null && operation == null && !demoMode;
+        }
+
+        private Repository RootNavigationRepository()
+        {
+            if (currentView == null || operation != null || demoMode) return null;
+            if (currentView.Kind == ViewKind.Directory && !String.IsNullOrEmpty(currentPath)) return currentRepository;
+            if (currentView.Kind == ViewKind.Repositories && files.SelectedItems.Count > 0) return files.SelectedItems[0].Tag as Repository;
+            return null;
+        }
+
+        private bool CanLocate(FileItem item)
+        {
+            return item != null && currentView != null && !IsRepositoryView(currentView) && operation == null && !demoMode;
         }
 
         private void ClearDetails()

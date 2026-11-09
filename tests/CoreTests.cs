@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -16,6 +17,10 @@ using LightSvnBrowser;
 
 public static class TestRunner
 {
+    private const string Utf8ErrorMode = "utf8-error";
+    private const string GbkErrorMode = "gbk-error";
+    private const string SvnErrorDiagnostic = "svn: E170001: Authorization failed.";
+    private const string ChineseErrorDiagnostic = "提交受限：部署文档/数据归档.zip";
     private static int _assertions;
     private static string _testRoot;
     private static string _svn;
@@ -36,7 +41,9 @@ public static class TestRunner
             TestConfiguration();
             TestUrls();
             TestNativeRepository().GetAwaiter().GetResult();
+            TestRevisionHistory().GetAwaiter().GetResult();
             TestSingleFileSubmission().GetAwaiter().GetResult();
+            TestAddItems().GetAwaiter().GetResult();
             if (!String.IsNullOrEmpty(_bundledSvn)) TestLoopbackAuthentication().GetAwaiter().GetResult();
             TestProcessIsolation().GetAwaiter().GetResult();
             TestCertificateCompatibility().GetAwaiter().GetResult();
@@ -204,6 +211,133 @@ public static class TestRunner
         Assert(File.ReadAllText(localFile) == "server committed despite post-commit hook failure\n", "submission and recovery preserve the user's editable local file");
     }
 
+    /// <summary>Checks atomic mixed additions, conflicts and interrupted commits in a private SVN repository.</summary>
+    /// <returns>A task that completes after the batch submission checks pass.</returns>
+    private static async Task TestAddItems()
+    {
+        const string destination = "目标 @ 目录";
+        const string directoryName = "中文 @ 文件夹";
+        const string fileName = "选中 @ 文件.txt";
+        const string nestedName = "default-ignored.exe";
+        const string emptyName = "empty";
+        const string payload = "local fixture bytes";
+        const string externalDirectory = "unrelated-external-change";
+        string root = Path.Combine(_testRoot, "add-items");
+        string repositoryPath = Path.Combine(root, "repo");
+        string input = Path.Combine(root, "selected");
+        string folder = Path.Combine(input, directoryName);
+        string file = Path.Combine(input, fileName);
+        Directory.CreateDirectory(Path.Combine(folder, emptyName));
+        Directory.CreateDirectory(Path.Combine(folder, ".svn"));
+        File.WriteAllText(file, payload, new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(folder, nestedName), payload, new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(folder, ".svn", "metadata"), payload, new UTF8Encoding(false));
+        RunLocal(Path.Combine(Path.GetDirectoryName(_svn), "svnadmin.exe"), "create", repositoryPath);
+        Repository repository = new Repository
+        {
+            Id = "add-items-fixture", Name = "Local additions fixture",
+            Url = new Uri(repositoryPath + Path.DirectorySeparatorChar).AbsoluteUri.TrimEnd('/')
+        };
+        RunSubmissionLocalOutput("mkdir", SvnService.BuildUrl(repository, destination) + "@", "-m", "create destination");
+        AppStore store = new AppStore(Path.Combine(root, "app-data"));
+        SvnService service = new SvnService(store, _svn);
+        IndexSnapshot baselineIndex = await service.BuildIndexAsync(repository, CancellationToken.None);
+        RunSubmissionLocalOutput("mkdir", SvnService.BuildUrl(repository, externalDirectory) + "@", "-m", "unrelated external change");
+
+        SubmissionResult added = await service.AddItemsAsync(repository, destination, new[] { folder, file }, "submit mixed selection", null, CancellationToken.None);
+        Assert(added.Status == SubmissionStatus.Committed && !String.IsNullOrEmpty(added.Revision), "mixed file and directory additions commit in one revision");
+        List<SvnEntry> entries = await service.ListAsync(repository, destination, true, CancellationToken.None);
+        string[] expected = { destination + "/" + fileName, destination + "/" + directoryName,
+            destination + "/" + directoryName + "/" + emptyName, destination + "/" + directoryName + "/" + nestedName };
+        Assert(entries.Count == expected.Length && entries.All(item => expected.Contains(item.Path) && item.Revision == added.Revision),
+            "additions preserve Unicode, @, empty directories and ignored files while excluding SVN metadata");
+        IndexSnapshot updatedIndex = new AppStore(store.DataDirectory).LoadIndex(repository.Id);
+        Assert(updatedIndex.Revision == baselineIndex.Revision && updatedIndex.Entries.Count == baselineIndex.Entries.Count + expected.Length
+            && expected.All(path => updatedIndex.Entries.Any(item => item.Path == path && item.Revision == added.Revision))
+            && updatedIndex.Entries.Any(item => item.Path == destination) && !updatedIndex.Entries.Any(item => item.Path == externalDirectory),
+            "confirmed additions merge only their metadata into the durable index and preserve its full-scan baseline");
+        FilenameSearchResult search = await new FilenameSearchEngine(store, service).SearchAsync(new[] { repository }, nestedName,
+            destination, expected.Length, null, CancellationToken.None);
+        Assert(search.Matches.Count == 1 && search.Matches[0].Entry.Path == destination + "/" + directoryName + "/" + nestedName,
+            "a nested added file is immediately searchable through the cached index");
+        SvnEntry addedFile = entries.Single(item => item.Name == fileName);
+        Assert(File.ReadAllText(await service.FetchAsync(repository, addedFile, CancellationToken.None)) == payload
+            && File.ReadAllText(file) == payload, "new file bytes match the source and local selections are preserved");
+
+        string blockedFile = Path.Combine(input, "blocked-by-conflict.txt");
+        File.WriteAllText(blockedFile, payload);
+        bool sameNameBlocked = false;
+        try { await service.AddItemsAsync(repository, destination, new[] { file, blockedFile }, "must not overwrite", null, CancellationToken.None); }
+        catch (IOException error) { sameNameBlocked = error.Message.Contains(fileName); }
+        Assert(sameNameBlocked && (await service.ListAsync(repository, destination, true, CancellationToken.None)).Count == entries.Count,
+            "a remote same-name conflict stops the entire batch before commit");
+
+        string racer = Path.Combine(input, "racer.txt");
+        File.WriteAllText(racer, payload);
+        const string racerContent = "added by another client";
+        string racerSource = Path.Combine(input, "racer-source.txt");
+        File.WriteAllText(racerSource, racerContent);
+        string mucc = Path.Combine(Path.GetDirectoryName(_svn), "svnmucc.exe");
+        string racerPath = destination + "/" + Path.GetFileName(racer);
+        SubmissionResult raced = await service.AddItemsAsync(repository, destination, new[] { racer, blockedFile }, "must not partially commit",
+            new SubmissionProgressCallback(delegate(SubmissionProgress progress)
+            {
+                if (progress.IsCommitting)
+                    RunLocal(mucc, "put", racerSource, SvnService.BuildUrl(repository, racerPath), "-m", "concurrent addition", "--non-interactive", "--no-auth-cache");
+            }), CancellationToken.None);
+        Assert(raced.Status == SubmissionStatus.NotCommitted && service.GetPendingAddItems(repository, destination) == null,
+            "a concurrent same-name addition rejects the batch and clears the pending barrier: " + raced.Message);
+        List<SvnEntry> afterRace = await service.ListAsync(repository, destination, false, CancellationToken.None);
+        Assert(afterRace.All(item => item.Name != Path.GetFileName(blockedFile))
+            && File.ReadAllText(await service.FetchAsync(repository, afterRace.Single(item => item.Path == racerPath), CancellationToken.None)) == racerContent,
+            "the concurrent file wins and other batch entries are not added");
+
+        const string policyMessage = "fixture policy denied this file";
+        string preCommitHook = Path.Combine(repositoryPath, "hooks", "pre-commit.bat");
+        File.WriteAllLines(preCommitHook, new[] { "@echo off", "echo " + policyMessage + " 1>&2", "exit /b 102" }, Encoding.ASCII);
+        try
+        {
+            SubmissionResult denied = await service.AddItemsAsync(repository, destination, new[] { blockedFile }, "rejected by pre-commit policy", null, CancellationToken.None);
+            Assert(denied.Status == SubmissionStatus.NotCommitted && denied.Message.Contains("E165001") && denied.Message.Contains(policyMessage),
+                "pre-commit rejection preserves the policy diagnostic and reports the batch as not committed");
+            Assert(service.GetPendingAddItems(repository, destination) == null
+                && (await service.ListAsync(repository, destination, false, CancellationToken.None)).All(item => item.Name != Path.GetFileName(blockedFile)),
+                "pre-commit rejection clears the pending attempt without adding a file");
+        }
+        finally { File.Delete(preCommitHook); }
+
+        Environment.SetEnvironmentVariable("LIGHTSVN_TEST_REAL_SVN", _svn);
+        Environment.SetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE", "drop-commit-response");
+        try
+        {
+            SvnService proxy = new SvnService(store, Assembly.GetExecutingAssembly().Location);
+            SubmissionResult lost = await proxy.AddItemsAsync(repository, destination, new[] { blockedFile }, "commit response lost", null, CancellationToken.None);
+            Assert(lost.Status == SubmissionStatus.Unknown, "a lost batch commit response is treated as uncertain");
+            string blockedPath = destination + "/" + Path.GetFileName(blockedFile);
+            Assert(!store.LoadIndex(repository.Id).Entries.Any(entry => entry.Path == blockedPath), "an unverified addition is absent from the index");
+            SvnService restarted = new SvnService(new AppStore(store.DataDirectory), _svn);
+            SubmissionAttempt pending = restarted.GetPendingAddItems(repository, destination);
+            Assert(pending != null && pending.Id == lost.Attempt.Id, "batch pending identity is restored after restarting");
+            string second = Path.Combine(input, "second.txt");
+            File.WriteAllText(second, payload);
+            bool repeatBlocked = false;
+            try { await restarted.AddItemsAsync(repository, destination, new[] { second }, "another batch", null, CancellationToken.None); }
+            catch (InvalidOperationException) { repeatBlocked = true; }
+            Assert(repeatBlocked, "pending additions block another submission to the same directory");
+            SubmissionResult verified = await restarted.VerifyAddItemsAsync(repository, pending, CancellationToken.None);
+            Assert(verified.Status == SubmissionStatus.Committed && restarted.GetPendingAddItems(repository, destination) == null
+                && (await restarted.GetLatestFileAsync(repository, blockedPath, CancellationToken.None)).Revision == verified.Revision,
+                "verification finds the exact batch in SVN history and clears the pending barrier");
+            Assert(new AppStore(store.DataDirectory).LoadIndex(repository.Id).Entries.Any(entry => entry.Path == blockedPath && entry.Revision == verified.Revision),
+                "verification after restart also merges the confirmed file into the durable index");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_REAL_SVN", null);
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_PROXY_MODE", null);
+        }
+    }
+
     /// <summary>Delivers submission progress synchronously so tests can model an external save at commit time.</summary>
     /// <remarks>Author: Codex; date: 2026-11-02.</remarks>
     private sealed class SubmissionProgressCallback : IProgress<SubmissionProgress>
@@ -362,6 +496,11 @@ public static class TestRunner
         string url = SvnService.BuildUrl(repository, "目录 @ new/说明 100%.txt");
         Assert(url.Contains("%20") && url.Contains("%40") && url.Contains("100%25.txt"), "URL escaping of spaces Unicode @ and percent");
         Assert(SvnService.BuildUrl(repository, String.Empty).EndsWith("%E7%A9%BA%E6%A0%BC"), "root URL normalized");
+        Assert(SvnService.BuildDisplayUrl(repository, String.Empty) == "https://example.invalid/svn/资料%20空格", "display URL shows Unicode at repository root");
+        Assert(SvnService.BuildDisplayUrl(repository, "目录 @ new/说明 100%.txt") == "https://example.invalid/svn/资料%20空格/目录%20%40%20new/说明%20100%25.txt",
+            "display URL shows Unicode path names and preserves ASCII escapes");
+        Assert(SvnService.BuildDisplayUrl(repository, "原样%E4%B8%AD#?.txt").EndsWith("/原样%25E4%25B8%25AD%23%3F.txt", StringComparison.Ordinal),
+            "display URL preserves literal escape-looking text and URI delimiters");
         Expect<ArgumentException>(delegate { SvnService.BuildUrl(repository, "../other.txt"); }, "path traversal rejected");
         Expect<ArgumentException>(delegate { SvnService.BuildUrl(repository, "/absolute.txt"); }, "absolute relative path rejected");
         Expect<ArgumentException>(delegate { SvnService.BuildUrl(repository, "x/./other.txt"); }, "dot segment rejected");
@@ -448,6 +587,67 @@ public static class TestRunner
         store.DeleteIndex(repository.Id);
         Assert(store.LoadIndex(repository.Id) == null, "index delete");
         Assert(!Directory.EnumerateDirectories(root, ".svn", SearchOption.AllDirectories).Any(), "application never creates a working copy");
+    }
+
+    private static async Task TestRevisionHistory()
+    {
+        string root = Path.Combine(_testRoot, "revision-history");
+        string repositoryPath = Path.Combine(root, "repo @ 历史");
+        Directory.CreateDirectory(root);
+        string svnDirectory = Path.GetDirectoryName(_svn);
+        RunLocal(Path.Combine(svnDirectory, "svnadmin.exe"), "create", repositoryPath);
+        Repository repository = new Repository
+        {
+            Id = "history", Url = new Uri(repositoryPath + Path.DirectorySeparatorChar).AbsoluteUri.TrimEnd('/')
+        };
+        SvnService service = new SvnService(new AppStore(Path.Combine(root, "app data")), _bundledSvn ?? _svn);
+        SvnHistoryPage empty = await service.GetHistoryAsync(repository, String.Empty, null, CancellationToken.None);
+        Assert(empty.Entries.Count == 0 && empty.NextRevision == null, "revision zero repository has no history");
+
+        const string directoryName = "目录 @ 100%";
+        const string filePath = directoryName + "/说明 & 文本 @.txt";
+        const string movedPath = directoryName + "/新名称 %.txt";
+        const string commitMessage = "提交 <摘要> & 验证\n第二行";
+        string fileUrl = SvnService.BuildUrl(repository, filePath);
+        string seed = Path.Combine(root, "seed");
+        Directory.CreateDirectory(Path.Combine(seed, directoryName));
+        File.WriteAllText(Path.Combine(seed, filePath), "content");
+        string messageFile = Path.Combine(root, "message.txt");
+        File.WriteAllText(messageFile, commitMessage, new UTF8Encoding(false));
+        RunLocal(_svn, "import", seed, repository.Url, "--file", messageFile, "--encoding", "UTF-8", "--non-interactive", "--no-auth-cache");
+        string mucc = Path.Combine(svnDirectory, "svnmucc.exe");
+        for (int revision = 2; revision <= 52; revision++)
+        {
+            string label = revision.ToString(CultureInfo.InvariantCulture);
+            RunLocal(mucc, "propset", "history-test", label, fileUrl, "-m", "change " + label,
+                "--non-interactive", "--no-auth-cache");
+        }
+        RunLocal(mucc, "mkdir", SvnService.BuildUrl(repository, "unrelated"), "-m", "change outside target folder",
+            "--non-interactive", "--no-auth-cache");
+
+        SvnHistoryPage rootPage = await service.GetHistoryAsync(repository, String.Empty, null, CancellationToken.None);
+        Assert(rootPage.Entries.First().Revision == "53", "repository root history includes unrelated folder changes");
+        SvnHistoryPage folderPage = await service.GetHistoryAsync(repository, directoryName, null, CancellationToken.None);
+        Assert(folderPage.Entries.First().Revision == "52" && folderPage.PegRevision == "53",
+            "directory history includes descendant changes while excluding unrelated changes");
+        SvnHistoryPage filePage = await service.GetHistoryAsync(repository, filePath, null, CancellationToken.None);
+        Assert(filePage.Entries.Count == 50 && filePage.Entries.Last().Revision == "3" && filePage.NextRevision == "2",
+            "file history first page has 50 descending entries and a next page cursor");
+
+        RunLocal(mucc, "mv", fileUrl, SvnService.BuildUrl(repository, movedPath), "-m", "move file after opening history",
+            "--non-interactive", "--no-auth-cache");
+        SvnHistoryPage olderPage = await service.GetHistoryAsync(repository, filePath, filePage, CancellationToken.None);
+        Assert(olderPage.Entries.Select(entry => entry.Revision).SequenceEqual(new[] { "2", "1" }) && olderPage.NextRevision == null,
+            "paging uses the original path snapshot even after a move, without gaps or duplicates");
+        SvnRevision initialCommit = olderPage.Entries.Last();
+        Assert(initialCommit.Message == commitMessage && !String.IsNullOrEmpty(initialCommit.Author)
+            && initialCommit.CommittedUtc.HasValue && initialCommit.CommittedUtc.Value.Kind == DateTimeKind.Utc,
+            "history parses multiline Unicode log, author and UTC timestamp");
+        SvnHistoryPage movedPage = await service.GetHistoryAsync(repository, movedPath, null, CancellationToken.None);
+        Assert(movedPage.Entries.Take(2).Select(entry => entry.Revision).SequenceEqual(new[] { "54", "52" }),
+            "fresh history follows SVN copy ancestry for renamed file");
+        Expect<OperationCanceledException>(() => service.GetHistoryAsync(repository, movedPath, null, new CancellationToken(true)).GetAwaiter().GetResult(),
+            "pre-canceled history request stops before running SVN");
     }
 
     private static async Task TestLoopbackAuthentication()
@@ -558,20 +758,25 @@ public static class TestRunner
         Assert(store.LoadIndex(repository.Id).Entries[0].ModifiedUtc.Kind == DateTimeKind.Utc, "missing date serializes without timezone underflow");
         string allLogs = String.Join("", Directory.GetFiles(store.LogDirectory).Select(File.ReadAllText));
         Assert(!allLogs.Contains(password), "logs contain no password");
-        int before = CountAttempts(root);
-        Environment.SetEnvironmentVariable("LIGHTSVN_TEST_MODE", "fail");
-        try
+        foreach (string mode in new[] { Utf8ErrorMode, GbkErrorMode })
         {
-            await service.ListAsync(repository, String.Empty, false, CancellationToken.None);
-            throw new Exception("Expected native authentication failure");
+            int before = CountAttempts(root);
+            Environment.SetEnvironmentVariable("LIGHTSVN_TEST_MODE", mode);
+            try
+            {
+                await service.ListAsync(repository, String.Empty, false, CancellationToken.None);
+                throw new Exception("Expected native authentication failure");
+            }
+            catch (SvnCommandException ex)
+            {
+                Assert(ex.Message.Contains(SvnErrorDiagnostic) && ex.Message.Contains(ChineseErrorDiagnostic), mode + " preserves the SVN error code and Chinese diagnostic");
+                Assert(ex.ServerError.Contains(ChineseErrorDiagnostic) && !ex.Message.Contains(password)
+                    && !ex.ServerError.Contains(password) && ex.ServerError.Contains("[已隐藏]"), mode + " redacts the password after decoding stderr");
+            }
+            Assert(CountAttempts(root) == before + 1, mode + " invokes exactly once without retries");
         }
-        catch (IOException ex)
-        {
-            Assert(!ex.Message.Contains(password), "native stderr secret redacted");
-        }
-        Assert(CountAttempts(root) == before + 1, "failure invokes exactly once without retries");
         allLogs = String.Join("", Directory.GetFiles(store.LogDirectory).Select(File.ReadAllText));
-        Assert(!allLogs.Contains(password), "failure logs redact native stderr password");
+        Assert(!allLogs.Contains(password) && allLogs.Contains(ChineseErrorDiagnostic), "failure logs preserve the diagnostic and redact the native stderr password");
         Environment.SetEnvironmentVariable("LIGHTSVN_TEST_MODE", "dtd");
         bool dtdRejected = false;
         try { await service.ListAsync(repository, String.Empty, false, CancellationToken.None); }
@@ -889,7 +1094,15 @@ public static class TestRunner
         File.WriteAllText(Path.Combine(root, "fake-proof.txt"), proof);
         string mode = Environment.GetEnvironmentVariable("LIGHTSVN_TEST_MODE");
         if (mode == "slow") { Thread.Sleep(30000); return 0; }
-        if (mode == "fail") { Console.Error.WriteLine("SVN fake auth failure " + password); return 7; }
+        if (mode == Utf8ErrorMode || mode == GbkErrorMode)
+        {
+            const int gbkCodePage = 936;
+            const int errorExitCode = 7;
+            Encoding encoding = mode == Utf8ErrorMode ? Encoding.UTF8 : Encoding.GetEncoding(gbkCodePage);
+            byte[] bytes = encoding.GetBytes(SvnErrorDiagnostic + "\r\n" + ChineseErrorDiagnostic + "\r\n" + password + "\r\n");
+            using (Stream stderr = Console.OpenStandardError()) stderr.Write(bytes, 0, bytes.Length);
+            return errorExitCode;
+        }
         if (mode == "dtd") { Console.Write("<!DOCTYPE lists [<!ENTITY data SYSTEM 'file:///C:/Windows/win.ini'>]><lists><list>&data;</list></lists>"); return 0; }
         if (mode == "oversize")
         {
